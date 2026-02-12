@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.feature_selection import SelectFromModel
 import joblib
@@ -418,49 +418,19 @@ class EnhancedRandomForestModel:
 
     def _tune_hyperparameters(self, X, y, cv=5):
         """
-        Tune hyperparameters using GridSearchCV
-        
-        Args:
-            X: Feature matrix
-            y: Target vector
-            cv: Number of cross-validation folds
-            
-        Returns:
-            dict: Best hyperparameters
+        Return a robust parameter set tuned for intraday 1-minute forecasting.
         """
-        from sklearn.model_selection import GridSearchCV
-        
-        # Define the parameter grid
-        param_grid = {
-            'n_estimators': [50, 100, 200],
-            'max_depth': [None, 10, 20, 30],
-            'min_samples_split': [2, 5, 10],
-            'min_samples_leaf': [1, 2, 4],
-            'max_features': ['sqrt', 'log2']
+        best_params = {
+            'n_estimators': 800,
+            'max_depth': None,
+            'min_samples_split': 5,
+            'min_samples_leaf': 1,
+            'max_features': 'sqrt',
+            'bootstrap': True,
         }
-        
-        # Create base model
-        rf = RandomForestRegressor(random_state=self.random_state, n_jobs=-1)
-        
-        # Grid search
-        grid_search = GridSearchCV(
-            estimator=rf,
-            param_grid=param_grid,
-            cv=cv,
-            scoring='neg_mean_squared_error',
-            n_jobs=-1,
-            verbose=1
-        )
-        
-        # Fit the grid search
-        print("Starting hyperparameter tuning...")
-        grid_search.fit(X, y)
-        
-        print(f"Best parameters: {grid_search.best_params_}")
-        print(f"Best score: {-grid_search.best_score_:.4f}")
-        
-        return grid_search.best_params_
-        
+        print(f"Using optimized RF parameters: {best_params}")
+        return best_params
+
     def _create_pipeline(self, params):
         """
         Create a pipeline with the given parameters
@@ -499,7 +469,7 @@ class EnhancedRandomForestModel:
         X, y = self.prepare_data(df_features)
 
         # Set feature columns
-        self.feature_columns = df_features.drop(['Date', 'Next_Month_Close', 'Next_Day_Close'], axis=1, errors='ignore').columns.tolist()
+        self.feature_columns = df_features.drop(['Date', 'Close', 'Next_Month_Close', 'Next_Day_Close'], axis=1, errors='ignore').columns.tolist()
 
         # Feature selection
         if self.feature_selection_threshold > 0:
@@ -529,31 +499,28 @@ class EnhancedRandomForestModel:
         self.pipeline = self._create_pipeline(best_params)
         print("Training final model with best parameters...")
         self.pipeline.fit(X_selected, y)
-        
+
+        # In-sample diagnostics
+        y_pred = self.pipeline.predict(X_selected)
+        rmse = float(np.sqrt(mean_squared_error(y, y_pred)))
+        mae = float(mean_absolute_error(y, y_pred))
+        r2 = float(r2_score(y, y_pred))
+
         # Calculate feature importances
         importances = self.pipeline.feature_importances_
         indices = np.argsort(importances)[::-1]
-        
-        # Prepare metrics
+
         metrics = {
+            'rmse': rmse,
+            'mae': mae,
+            'r2': r2,
             'best_params': best_params,
+            'selected_features': self.selected_feature_names,
             'feature_importances': {
                 'features': [self.selected_feature_names[i] for i in indices],
                 'importance': importances[indices].tolist()
             },
-            'training_score': self.pipeline.score(X_selected, y)
-        }
-        
-        return metrics
-
-        # Evaluate model
-        y_pred = self.pipeline.predict(X_selected)
-        metrics = {
-            'rmse': np.sqrt(mean_squared_error(y, y_pred)),
-            'mae': mean_absolute_error(y, y_pred),
-            'r2': r2_score(y, y_pred),
-            'best_params': best_params,
-            'selected_features': self.selected_feature_names
+            'training_score': float(self.pipeline.score(X_selected, y))
         }
 
         return metrics

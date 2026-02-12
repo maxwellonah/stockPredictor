@@ -157,7 +157,7 @@ def train_rf_model(df, status_div_id):
         print("Starting RF model training...")
         # Create model
         rf_model = EnhancedRandomForestModel(
-            feature_selection_threshold=0.02,
+            feature_selection_threshold=0.0,
             random_state=42,
             horizon_steps=30
         )
@@ -189,8 +189,19 @@ def train_lstm_model(df, status_div_id):
     """Train LSTM model and return metrics"""
     try:
         print("Starting LSTM model training...")
-        # Define features
-        features = ['Close', 'Volume', 'MA7', 'MA20', 'RSI', 'MACD', 'Sentiment_Score', 'Sentiment_Magnitude', 'Sentiment_Volume', 'Sentiment_Trend', 'Sentiment_Volatility']
+        # Define a richer feature set for better 2-hour forecasting accuracy
+        features = [
+            'Close', 'Open', 'High', 'Low', 'Volume',
+            'Return', 'Log_Return', 'Volume_Change',
+            'MA7', 'MA14', 'MA21', 'MA50',
+            'Volatility7', 'Volatility14', 'Volatility21',
+            'RSI', 'RSI_Trend', 'MACD', 'MACD_Signal', 'MACD_Hist',
+            'BB_width', 'BB_position',
+            'Momentum7', 'Momentum14', 'Momentum21',
+            'Price_to_MA50',
+            'Day_of_Week', 'Month',
+            'Sentiment_Score', 'Sentiment_Magnitude', 'Sentiment_Volume', 'Sentiment_Trend', 'Sentiment_Volatility'
+        ]
         
         # Ensure all required features are in the dataframe
         required_cols = ['Date', 'Close', 'Volume']
@@ -203,7 +214,7 @@ def train_lstm_model(df, status_div_id):
         
         # Create model
         print("Initializing LSTM model...")
-        lstm_model = LSTMModel(time_steps=60, features=features, epochs=50, batch_size=32, horizon_steps=120)
+        lstm_model = LSTMModel(time_steps=90, features=features, epochs=80, batch_size=32, horizon_steps=120)
         
         # Train model
         print("Training LSTM model...")
