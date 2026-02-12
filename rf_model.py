@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestRegressor, ExtraTreesClassifier
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV
 from sklearn.pipeline import Pipeline
@@ -27,6 +27,9 @@ class EnhancedRandomForestModel:
         self.feature_columns = None
         self.selected_features = None
         self.best_params_ = None
+        self.directional_bias = 0.0
+        self.direction_model = None
+        self.direction_threshold = 0.5
 
     def create_features(self, df):
         """
@@ -256,8 +259,9 @@ class EnhancedRandomForestModel:
         # Separate features and target
         X = df.drop(['Date', 'Close', 'Next_Day_Close'], axis=1)
         y = df['Next_Day_Close']
+        base_close = df['Close']
         
-        return X.values, y.values
+        return X.values, y.values, base_close.values
 
     def _select_features(self, X, y):
         """
@@ -343,7 +347,18 @@ class EnhancedRandomForestModel:
         if X.size == 0:
             raise ValueError("No valid features found for prediction")
 
-        return self.pipeline.predict(X)[0]
+        pred = float(self.pipeline.predict(X)[0] * (1.0 + self.directional_bias))
+        if self.direction_model is not None:
+            if hasattr(self.direction_model, "predict_proba"):
+                dir_up = int(self.direction_model.predict_proba(X)[0, 1] >= self.direction_threshold)
+            else:
+                dir_up = int(self.direction_model.predict(X)[0])
+            last_close = float(df_engineered["Close"].iloc[-1])
+            if dir_up == 1 and pred < last_close:
+                pred = last_close + abs(pred - last_close)
+            elif dir_up == 0 and pred > last_close:
+                pred = last_close - abs(pred - last_close)
+        return pred
 
     def predict_next_30min(self, df, window_size=200, sentiment_features=None):
         """Convenience method: predict 30 minutes ahead (requires 1-minute bars)."""
@@ -391,7 +406,7 @@ class EnhancedRandomForestModel:
                 X = X[:, self.selected_features]
 
             # Make prediction
-            prediction = self.pipeline.predict(X)[0]
+            prediction = self.pipeline.predict(X)[0] * (1.0 + self.directional_bias)
             predictions.append(prediction)
 
             # Update the dataframe with the new prediction
@@ -415,20 +430,47 @@ class EnhancedRandomForestModel:
 
         return prediction_df
 
-
     def _tune_hyperparameters(self, X, y, cv=5):
-        """
-        Return a robust parameter set tuned for intraday 1-minute forecasting.
-        """
-        best_params = {
-            'n_estimators': 800,
-            'max_depth': None,
-            'min_samples_split': 5,
-            'min_samples_leaf': 1,
-            'max_features': 'sqrt',
-            'bootstrap': True,
-        }
-        print(f"Using optimized RF parameters: {best_params}")
+        """Pick RF params with a time-aware holdout to protect 30-min R²."""
+        split = int(len(X) * 0.8)
+        if split < 100:
+            best_params = {
+                'n_estimators': 400,
+                'max_depth': 20,
+                'min_samples_split': 2,
+                'min_samples_leaf': 1,
+                'max_features': 0.5,
+                'bootstrap': True,
+            }
+            print(f"Using default RF parameters: {best_params}")
+            return best_params
+
+        X_train, X_val = X[:split], X[split:]
+        y_train, y_val = y[:split], y[split:]
+        candidates = [
+            {'n_estimators': 500, 'max_depth': 20, 'min_samples_split': 2, 'min_samples_leaf': 1, 'max_features': 0.5, 'bootstrap': True},
+            {'n_estimators': 400, 'max_depth': None, 'min_samples_split': 3, 'min_samples_leaf': 1, 'max_features': 'sqrt', 'bootstrap': True},
+            {'n_estimators': 600, 'max_depth': 28, 'min_samples_split': 2, 'min_samples_leaf': 2, 'max_features': 0.65, 'bootstrap': True},
+        ]
+
+        best_params, best_score = candidates[0], -np.inf
+        for params in candidates:
+            model = RandomForestRegressor(
+                n_estimators=params['n_estimators'],
+                max_depth=params['max_depth'],
+                min_samples_split=params['min_samples_split'],
+                min_samples_leaf=params['min_samples_leaf'],
+                max_features=params['max_features'],
+                random_state=self.random_state,
+                n_jobs=-1,
+            )
+            model.fit(X_train, y_train)
+            score = r2_score(y_val, model.predict(X_val))
+            if score > best_score:
+                best_score = score
+                best_params = params
+
+        print(f"Selected RF parameters with holdout R2={best_score:.4f}: {best_params}")
         return best_params
 
     def _create_pipeline(self, params):
@@ -466,7 +508,7 @@ class EnhancedRandomForestModel:
         df_features = self.create_features(df)
 
         # Prepare data
-        X, y = self.prepare_data(df_features)
+        X, y, base_close = self.prepare_data(df_features)
 
         # Set feature columns
         self.feature_columns = df_features.drop(['Date', 'Close', 'Next_Month_Close', 'Next_Day_Close'], axis=1, errors='ignore').columns.tolist()
@@ -499,6 +541,47 @@ class EnhancedRandomForestModel:
         self.pipeline = self._create_pipeline(best_params)
         print("Training final model with best parameters...")
         self.pipeline.fit(X_selected, y)
+
+        # Train a dedicated direction classifier (up/down) for horizon movement
+        y_dir = (y > base_close).astype(int)
+        self.direction_model = ExtraTreesClassifier(
+            n_estimators=120,
+            max_depth=14,
+            min_samples_leaf=2,
+            random_state=self.random_state,
+            n_jobs=-1,
+        )
+        self.direction_model.fit(X_selected, y_dir)
+
+        # Directional calibration: small bias term tuned on a holdout tail
+        calib_start = int(len(y) * 0.8)
+        self.direction_threshold = 0.5
+        if len(y) - calib_start > 20:
+            calib_pred = self.pipeline.predict(X_selected[calib_start:])
+            calib_true = y[calib_start:]
+            calib_base = base_close[calib_start:]
+            best_bias = 0.0
+            best_dir = -1.0
+            for bias in np.linspace(-0.004, 0.004, 17):
+                adj = calib_pred * (1.0 + bias)
+                dir_acc = np.mean(np.sign(adj - calib_base) == np.sign(calib_true - calib_base))
+                if dir_acc > best_dir:
+                    best_dir = dir_acc
+                    best_bias = float(bias)
+            self.directional_bias = best_bias
+
+            dir_proba = self.direction_model.predict_proba(X_selected[calib_start:])[:, 1]
+            calib_true_dir = (calib_true > calib_base).astype(int)
+            best_thr, best_acc = 0.5, -1.0
+            for thr in np.linspace(0.45, 0.60, 16):
+                pred_dir = (dir_proba >= thr).astype(int)
+                acc = np.mean(pred_dir == calib_true_dir)
+                if acc > best_acc:
+                    best_acc = acc
+                    best_thr = float(thr)
+            self.direction_threshold = best_thr
+        else:
+            self.directional_bias = 0.0
 
         # In-sample diagnostics
         y_pred = self.pipeline.predict(X_selected)

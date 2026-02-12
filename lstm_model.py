@@ -206,97 +206,80 @@ class LSTMModel:
 
     def train(self, train_df, val_df=None):
         df_features = self.create_features(train_df)
-        
-        # Validate dataset size
+
         min_required = self.time_steps + self.horizon_steps + 1
         if len(df_features) < min_required:
             raise ValueError(f"Requires at least {min_required} data points")
-        
-        # Ensure all features exist in the dataframe
+
         missing_features = [f for f in self.features if f not in df_features.columns]
         if missing_features:
             raise ValueError(f"Missing features in data: {missing_features}")
-        
-        # Use RobustScaler for better handling of outliers
+
+        X_tab, y_tab, base_tab = self._build_tabular_dataset(df_features)
+        if len(y_tab) < 500:
+            raise ValueError("Insufficient samples for 2-hour training")
+
+        split_tab = int(len(X_tab) * 0.85)
+        X_train_tab, X_val_tab = X_tab[:split_tab], X_tab[split_tab:]
+        y_train_tab, y_val_tab = y_tab[:split_tab], y_tab[split_tab:]
+        base_train_tab = base_tab[:split_tab]
+        base_val_tab = base_tab[split_tab:]
+
+        self.tabular_model = HistGradientBoostingRegressor(
+            loss='squared_error',
+            learning_rate=0.03,
+            max_iter=250,
+            max_leaf_nodes=63,
+            min_samples_leaf=20,
+            l2_regularization=0.1,
+            random_state=42,
+        )
+        self.tabular_model.fit(X_train_tab, y_train_tab)
+
         self.scaler = RobustScaler()
-        
-        # Prepare training data
-        train_data = self.scaler.fit_transform(df_features[self.features].values)
-        X_train, y_train = self.create_sequences(train_data)
-        
-        # Data augmentation for time series
-        X_train_augmented, y_train_augmented = self._augment_data(X_train, y_train, augmentation_factor=1.1)
-        
-        # Prepare validation data
-        val_data = None
-        X_val, y_val = None, None
-        if val_df is not None:
-            val_features = self.create_features(val_df)
-            # Check if validation data has enough rows
-            if len(val_features) >= self.time_steps:
-                val_data = self.scaler.transform(val_features[self.features].values)
-                try:
-                    X_val, y_val = self.create_sequences(val_data)
-                except ValueError:
-                    # Not enough validation data for sequences
-                    X_val, y_val = None, None
-        
-        # If no validation data provided, create a validation split
-        if X_val is None:
-            # Use the last 20% of training data as validation
-            split_idx = int(len(X_train) * 0.8)
-            X_val = X_train[split_idx:]
-            y_val = y_train[split_idx:]
-            X_train = X_train[:split_idx]
-            y_train = y_train[:split_idx]
-        
-        self.build_model((self.time_steps, len(self.features)))
-        
-        # Enhanced callbacks for better training
-        callbacks = [
-            # Early stopping with patience
-            EarlyStopping(
-                monitor='val_loss',
-                patience=20,
-                restore_best_weights=True,
-                verbose=1
-            ),
-            # Reduce learning rate when training plateaus
-            ReduceLROnPlateau(
-                monitor='val_loss',
-                factor=0.5,
-                patience=7,
-                min_lr=1e-6,
-                verbose=1
-            ),
-            # Custom learning rate scheduler
-            LearningRateScheduler(
-                lambda epoch, lr: lr * (0.95 ** (epoch // 5)) if epoch > 10 else lr
-            )
-        ]
-        
-        # Train with augmented data
-        history = self.model.fit(
-            X_train_augmented, y_train_augmented,
-            validation_data=(X_val, y_val),
-            epochs=self.epochs,
-            batch_size=self.batch_size,
-            callbacks=callbacks,
-            shuffle=False,
-            verbose=0
+        self.scaler.fit(df_features[self.features].values)
+
+        val_pred = self.tabular_model.predict(X_val_tab)
+        y_dir_train = (y_train_tab > base_train_tab).astype(int)
+        self.direction_model = RandomForestClassifier(
+            n_estimators=500,
+            max_depth=10,
+            min_samples_leaf=2,
+            random_state=42,
+            n_jobs=-1,
         )
-        
-        # Fine-tune with original data
-        self.model.fit(
-            X_train, y_train,
-            validation_data=(X_val, y_val),
-            epochs=max(1, self.epochs // 5),
-            batch_size=self.batch_size,
-            callbacks=callbacks,
-            verbose=0
-        )
-        
-        return history.history
+        self.direction_model.fit(X_train_tab, y_dir_train)
+
+        val_dir_pred = self.direction_model.predict(X_val_tab)
+        dir_acc = float(np.mean(val_dir_pred == (y_val_tab > base_val_tab).astype(int)))
+        mae = float(np.mean(np.abs(val_pred - y_val_tab)))
+        return {
+            'model': 'tabular_hgbr',
+            'val_mae': mae,
+            'val_directional_accuracy': dir_acc,
+        }
+
+    def _build_tabular_dataset(self, df_features):
+        feature_df = df_features[self.features].copy()
+        feature_df['Target_Close'] = df_features['Close'].shift(-self.horizon_steps)
+        feature_df['Base_Close'] = df_features['Close']
+        feature_df = feature_df.dropna().reset_index(drop=True)
+        X = feature_df[self.features].values
+        y = feature_df['Target_Close'].values
+        base = feature_df['Base_Close'].values
+        return X, y, base
+
+    def _predict_with_tabular_model(self, df_features):
+        row = df_features[self.features].iloc[-1:].values
+        pred = float(self.tabular_model.predict(row)[0])
+        last_close = float(df_features['Close'].iloc[-1])
+        if self.direction_model is not None:
+            dir_up = int(self.direction_model.predict(row)[0])
+            if dir_up == 1 and pred < last_close:
+                pred = last_close + abs(pred - last_close)
+            elif dir_up == 0 and pred > last_close:
+                pred = last_close - abs(pred - last_close)
+        return pred, last_close
 
     def add_sentiment_features(self, df, sentiment_features):
         """
@@ -370,7 +353,18 @@ class LSTMModel:
                 print(f"Warning: Missing features in data: {missing_features}")
                 return self._fallback_prediction(df)
             
-            # Use the most recent time_steps data points for prediction
+            # Use tabular horizon model when available
+            if self.tabular_model is not None:
+                predicted_price, last_close = self._predict_with_tabular_model(df_features)
+                uncertainty = abs(predicted_price - last_close) * 0.25
+                return {
+                    'predicted_price': predicted_price,
+                    'confidence_interval': (predicted_price - 1.96 * uncertainty, predicted_price + 1.96 * uncertainty),
+                    'uncertainty': uncertainty,
+                    'method': 'tabular_hgbr_2h'
+                }
+
+            # Fallback to legacy LSTM path
             df_features = df_features.iloc[-self.time_steps:].copy()
             
             # Check if we have enough data after feature creation and dropping NAs
@@ -834,7 +828,9 @@ class LSTMModel:
                     'time_steps': self.time_steps,
                     'horizon_steps': self.horizon_steps,
                     'target_index': self.target_index
-                }
+                },
+                'tabular_model': self.tabular_model,
+                'direction_model': self.direction_model,
             }
             joblib.dump(metadata, keras_path + '_meta.pkl')
             print(f"Model metadata saved to {keras_path}_meta.pkl")
@@ -931,6 +927,8 @@ class LSTMModel:
             model.time_steps = meta['config']['time_steps']
             model.horizon_steps = meta['config'].get('horizon_steps', model.horizon_steps)
             model.target_index = meta['config']['target_index']
+            model.tabular_model = meta.get('tabular_model')
+            model.direction_model = meta.get('direction_model')
             print(f"Metadata loaded from {meta_path}")
             
             return model

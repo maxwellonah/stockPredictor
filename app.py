@@ -217,7 +217,7 @@ def train_lstm_model(df, status_div_id):
         lstm_model = LSTMModel(time_steps=90, features=features, epochs=80, batch_size=32, horizon_steps=120)
         
         # Train model
-        print("Training LSTM model...")
+        print("Training AI 2-Hour Model...")
         history = lstm_model.train(df)
         
         # Ensure models directory exists
@@ -289,7 +289,7 @@ app.layout = dbc.Container([
     dbc.Row([
         dbc.Col([
             html.H1("Hybrid Stock Prediction System", className="text-center my-4"),
-            html.P("Combining Random Forest (Daily) and LSTM (Monthly) predictions", className="text-center text-muted mb-4")
+            html.P("Using AI models for 30-minute and 2-hour intraday predictions", className="text-center text-muted mb-4")
         ])
     ]),
     
@@ -301,11 +301,11 @@ app.layout = dbc.Container([
                 dbc.Row([
                     dbc.Col(dbc.Card([
                         html.Div(id="rf-status", className="text-center p-2", 
-                                children="Random Forest: Ready")
+                                children="AI 30-Min Model: Ready")
                     ], color="light"), width=6),
                     dbc.Col(dbc.Card([
                         html.Div(id="lstm-status", className="text-center p-2", 
-                                children="LSTM: Ready")
+                                children="AI 2-Hour Model: Ready")
                     ], color="light"), width=6),
                 ])
             ], className="mb-4")
@@ -414,11 +414,11 @@ app.layout = dbc.Container([
                         dbc.Tab([
                             html.Div(id="rf-prediction-results"),
                             dcc.Graph(id="rf-prediction-chart")
-                        ], label="Random Forest (Daily)"),
+                        ], label="AI 30-Min Model"),
                         dbc.Tab([
                             html.Div(id="lstm-prediction-results"),
                             dcc.Graph(id="lstm-prediction-chart")
-                        ], label="LSTM (Monthly)"),
+                        ], label="AI 2-Hour Model"),
                         dbc.Tab([
                             html.Div(id="sentiment-summary-cards", className="mb-3"),
                             dcc.Graph(id="sentiment-history-chart")
@@ -657,7 +657,7 @@ def update_technical_charts(data):
 )
 def train_models(n_clicks, data):
     if n_clicks is None or data is None:
-        return "Random Forest: Ready", "LSTM: Ready", None, None, False, "", False, "", "", ""
+        return "AI 30-Min Model: Ready", "AI 2-Hour Model: Ready", None, None, False, "", False, "", "", ""
     
     try:
         from io import StringIO
@@ -682,8 +682,8 @@ def train_models(n_clicks, data):
         error_msg = f"Error loading data: {str(e)}"
         print(error_msg)
         return (
-            "Random Forest: Error", 
-            "LSTM: Error", 
+            "AI 30-Min Model: Error", 
+            "AI 2-Hour Model: Error", 
             None, 
             None, 
             True, 
@@ -707,8 +707,8 @@ def train_models(n_clicks, data):
     ])
     
     # Train RF model
-    rf_status = "Random Forest: Training..."
-    lstm_status = "LSTM: Waiting..."
+    rf_status = "AI 30-Min Model: Training..."
+    lstm_status = "AI 2-Hour Model: Waiting..."
     
     # Spinner content - show during training
     rf_spinner_content = "Training RF"
@@ -717,21 +717,21 @@ def train_models(n_clicks, data):
     # Train RF model
     rf_model, rf_metrics = train_rf_model(df, "rf-status")
     if rf_model is not None:
-        rf_status = "Random Forest: Trained"
+        rf_status = "AI 30-Min Model: Trained"
         rf_model_info = {"model_path": "models/rf_model.joblib", "metrics": rf_metrics}
     else:
-        rf_status = f"Random Forest: Error - {rf_metrics.get('error', 'Unknown error')}"
+        rf_status = f"AI 30-Min Model: Error - {rf_metrics.get('error', 'Unknown error')}"
         rf_model_info = None
     
     # Train LSTM model
-    lstm_status = "LSTM: Training..."
-    lstm_spinner_content = "Training LSTM"
+    lstm_status = "AI 2-Hour Model: Training..."
+    lstm_spinner_content = "Training AI 2-Hour Model"
     lstm_model, lstm_history = train_lstm_model(df, "lstm-status")
     if lstm_model is not None:
-        lstm_status = "LSTM: Trained"
+        lstm_status = "AI 2-Hour Model: Trained"
         lstm_model_info = {"model_path": "models/lstm_model.h5", "history": str(lstm_history)}
     else:
-        lstm_status = f"LSTM: Error - {lstm_history.get('error', 'Unknown error')}"
+        lstm_status = f"AI 2-Hour Model: Error - {lstm_history.get('error', 'Unknown error')}"
         lstm_model_info = None
     
     # Show completion notification
@@ -804,10 +804,10 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info):
         }
     
     # Initialize results
-    rf_results = html.Div("No Random Forest model trained.")
-    lstm_results = html.Div("No LSTM model trained.")
-    rf_fig = go.Figure().update_layout(title="No Random Forest predictions available")
-    lstm_fig = go.Figure().update_layout(title="No LSTM predictions available")
+    rf_results = html.Div("No AI 30-Min model trained.")
+    lstm_results = html.Div("No AI 2-Hour model trained.")
+    rf_fig = go.Figure().update_layout(title="No AI 30-Min predictions available")
+    lstm_fig = go.Figure().update_layout(title="No AI 2-Hour predictions available")
     rf_predictions = None
     lstm_predictions = None
     
@@ -833,7 +833,7 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info):
             
             # Create results display
             rf_results = html.Div([
-                html.H5("Random Forest 30-Minute Prediction"),
+                html.H5("AI 30-Minute Prediction"),
                 html.P(f"Last Close: ${last_price:.2f}"),
                 html.P(f"Predicted Next 30 Minutes: ${next_day_price:.2f}"),
                 html.P([
@@ -878,7 +878,7 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info):
             
             # Update layout
             rf_fig.update_layout(
-                title="Random Forest 30-Minute Prediction",
+                title="AI 30-Minute Prediction",
                 xaxis_title="Date",
                 yaxis_title="Price",
                 height=400,
@@ -979,7 +979,7 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info):
             
             # Create results display with uncertainty information
             lstm_results = html.Div([
-                html.H5("LSTM 2-Hour Prediction"),
+                html.H5("AI 2-Hour Prediction"),
                 html.P(f"Last Close: ${last_price:.2f}"),
                 html.P(f"Predicted Next 2 Hours: ${next_month_price:.2f}"),
                 html.P([
@@ -1042,7 +1042,7 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info):
             
             # Update layout
             lstm_fig.update_layout(
-                title="LSTM 2-Hour Prediction",
+                title="AI 2-Hour Prediction",
                 xaxis_title="Date",
                 yaxis_title="Price",
                 height=400,
@@ -1058,7 +1058,7 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info):
             }).to_json(date_format='iso', orient='split')
             
         except Exception as e:
-            lstm_results = html.Div(f"Error making LSTM predictions: {str(e)}")
+            lstm_results = html.Div(f"Error making AI 2-Hour predictions: {str(e)}")
     
     # Show prediction notification
     training_notification = True
