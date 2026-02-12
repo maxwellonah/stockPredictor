@@ -25,6 +25,8 @@ class LSTMModel:
         self.model = None
         self.scaler = StandardScaler()
         self.target_index = self.features.index('Close') if 'Close' in self.features else 0
+        np.random.seed(42)
+        tf.random.set_seed(42)
 
     def create_features(self, df, for_training=True):
         df = df.copy()
@@ -200,7 +202,7 @@ class LSTMModel:
         
         # Create model
         self.model = tf.keras.Model(inputs=inputs, outputs=outputs)
-        self.model.compile(optimizer=Adam(0.001), loss='mse', metrics=['mae'])
+        self.model.compile(optimizer=Adam(learning_rate=0.001, clipnorm=1.0), loss=tf.keras.losses.Huber(delta=1.0), metrics=['mae'])
 
     def train(self, train_df, val_df=None):
         df_features = self.create_features(train_df)
@@ -223,7 +225,7 @@ class LSTMModel:
         X_train, y_train = self.create_sequences(train_data)
         
         # Data augmentation for time series
-        X_train_augmented, y_train_augmented = self._augment_data(X_train, y_train)
+        X_train_augmented, y_train_augmented = self._augment_data(X_train, y_train, augmentation_factor=1.1)
         
         # Prepare validation data
         val_data = None
@@ -255,7 +257,7 @@ class LSTMModel:
             # Early stopping with patience
             EarlyStopping(
                 monitor='val_loss',
-                patience=15,
+                patience=20,
                 restore_best_weights=True,
                 verbose=1
             ),
@@ -263,7 +265,7 @@ class LSTMModel:
             ReduceLROnPlateau(
                 monitor='val_loss',
                 factor=0.5,
-                patience=5,
+                patience=7,
                 min_lr=1e-6,
                 verbose=1
             ),
@@ -281,7 +283,7 @@ class LSTMModel:
             batch_size=self.batch_size,
             callbacks=callbacks,
             shuffle=False,
-            verbose=1
+            verbose=0
         )
         
         # Fine-tune with original data
@@ -291,7 +293,7 @@ class LSTMModel:
             epochs=max(1, self.epochs // 5),
             batch_size=self.batch_size,
             callbacks=callbacks,
-            verbose=1
+            verbose=0
         )
         
         return history.history

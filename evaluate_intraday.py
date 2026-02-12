@@ -16,48 +16,29 @@ def _directional_accuracy(y_true, y_pred, base_price):
 
 
 def evaluate_rf_intraday(df, horizon_steps=30, test_size=0.2, random_state=42):
-    d = df.copy()
-    d["Target"] = d["Close"].shift(-horizon_steps)
-    d = d.dropna().reset_index(drop=True)
+    d = df.copy().dropna(subset=["Close"]).reset_index(drop=True)
 
     split = int(len(d) * (1.0 - test_size))
     train_df = d.iloc[:split].copy()
     test_df = d.iloc[split:].copy()
 
-    rf_pipe_model = EnhancedRandomForestModel(horizon_steps=horizon_steps)
-    feats_train = rf_pipe_model.create_features(train_df)
-    if 'Sentiment_Score' not in feats_train.columns:
-        feats_train['Sentiment_Score'] = 0
-        feats_train['Sentiment_Magnitude'] = 0
-        feats_train['Sentiment_Volume'] = 0
-        feats_train['Sentiment_Trend'] = 0
-        feats_train['Sentiment_Volatility'] = 0
-
-    X_train = feats_train.drop(columns=["Date", "Close", "Next_Day_Close"], errors="ignore")
-    y_train = feats_train["Next_Day_Close"].values
-
-    rf = RandomForestRegressor(
-        n_estimators=800,
+    model = EnhancedRandomForestModel(
+        feature_selection_threshold=0.0,
         random_state=random_state,
-        n_jobs=-1,
-        max_depth=None,
-        min_samples_leaf=1,
-        min_samples_split=5,
-        max_features="sqrt",
+        horizon_steps=horizon_steps,
     )
-    rf.fit(X_train, y_train)
+    train_metrics = model.train(train_df, cv=3)
 
-    feats_test = rf_pipe_model.create_features(test_df)
-    if 'Sentiment_Score' not in feats_test.columns:
-        feats_test['Sentiment_Score'] = 0
-        feats_test['Sentiment_Magnitude'] = 0
-        feats_test['Sentiment_Volume'] = 0
-        feats_test['Sentiment_Trend'] = 0
-        feats_test['Sentiment_Volatility'] = 0
-
+    feats_test = model.create_features(test_df)
     X_test = feats_test.drop(columns=["Date", "Close", "Next_Day_Close"], errors="ignore")
+
+    # Align test columns to training feature order
+    X_test = X_test.reindex(columns=model.feature_columns, fill_value=0)
+    if model.selected_features is not None:
+        X_test = X_test[model.selected_feature_names]
+
     y_true = feats_test["Next_Day_Close"].values
-    y_pred = rf.predict(X_test)
+    y_pred = model.pipeline.predict(X_test.values)
 
     mae = float(mean_absolute_error(y_true, y_pred))
     rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
@@ -74,13 +55,12 @@ def evaluate_rf_intraday(df, horizon_steps=30, test_size=0.2, random_state=42):
         "r2": r2,
         "mape": mape,
         "directional_accuracy": dir_acc,
+        "best_params": train_metrics.get("best_params", {}),
     }
 
 
 def evaluate_lstm_intraday(df, horizon_steps=120, test_size=0.2, epochs=3, batch_size=64, time_steps=60):
-    d = df.copy()
-    d["Target"] = d["Close"].shift(-horizon_steps)
-    d = d.dropna().reset_index(drop=True)
+    d = df.copy().dropna(subset=["Close"]).reset_index(drop=True)
 
     split = int(len(d) * (1.0 - test_size))
     train_df = d.iloc[:split].copy()
@@ -146,7 +126,7 @@ def evaluate_lstm_intraday(df, horizon_steps=120, test_size=0.2, epochs=3, batch
     base_indices = (seq_indices + time_steps - 1)[mask]
     base_prices = combined_close[base_indices]
 
-    y_pred = model.model.predict(X_test).flatten()
+    y_pred = model.model.predict(X_test, verbose=0).flatten()
 
     # Inverse transform predictions and actual values
     dummy = np.zeros((len(y_pred), len(model.features)))
@@ -184,6 +164,7 @@ def main():
     parser.add_argument("--lstm_horizon", type=int, default=120)
     parser.add_argument("--lstm_epochs", type=int, default=15)
     parser.add_argument("--lstm_time_steps", type=int, default=60)
+    parser.add_argument("--csv", default=None, help="Optional local CSV path with Date,Open,High,Low,Close,Volume")
     args = parser.parse_args()
 
     ticker = args.ticker
@@ -191,13 +172,20 @@ def main():
     print(f"Evaluating intraday models for {ticker} on 1-minute bars")
     print(f"RF horizon: {args.rf_horizon} minutes | LSTM horizon: {args.lstm_horizon} minutes | LSTM time_steps: {args.lstm_time_steps}")
 
-    to_date = datetime.now().strftime('%Y-%m-%d')
-    from_date = (datetime.now() - timedelta(days=args.days)).strftime('%Y-%m-%d')
-    df = app.fetch_stock_data(ticker, timespan="minute", multiplier=1, from_date=from_date, to_date=to_date)
-    if df is None or df.empty:
-        raise SystemExit("Failed to fetch 1-minute data")
+    if args.csv:
+        import pandas as pd
+        df = pd.read_csv(args.csv)
+        df['Date'] = pd.to_datetime(df['Date'])
+        if 'Sentiment_Score' not in df.columns:
+            df = app.add_time_aligned_sentiment(df, ticker)
+    else:
+        to_date = datetime.now().strftime('%Y-%m-%d')
+        from_date = (datetime.now() - timedelta(days=args.days)).strftime('%Y-%m-%d')
+        df = app.fetch_stock_data(ticker, timespan="minute", multiplier=1, from_date=from_date, to_date=to_date)
+        if df is None or df.empty:
+            raise SystemExit("Failed to fetch 1-minute data")
+        df = app.add_time_aligned_sentiment(df, ticker)
 
-    df = app.add_time_aligned_sentiment(df, ticker)
     df = app.calculate_technical_indicators(df)
     df = df.sort_values("Date").reset_index(drop=True)
 
@@ -205,6 +193,7 @@ def main():
     print("RF_30MIN" if args.rf_horizon == 30 else f"RF_{args.rf_horizon}")
     for k in ["rows", "train_rows", "test_rows", "mae", "rmse", "r2", "mape", "directional_accuracy"]:
         print(f"{k}: {rf_metrics[k]}")
+    print(f"best_params: {rf_metrics.get('best_params', {})}")
 
     lstm_metrics = evaluate_lstm_intraday(
         df,
