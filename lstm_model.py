@@ -4,6 +4,7 @@ import tensorflow as tf
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.model_selection import TimeSeriesSplit
+from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingRegressor
 from tensorflow.keras.models import Sequential, Model
 from tensorflow.keras.layers import Bidirectional, LSTM, Dense, Dropout, Input, Concatenate
 from tensorflow.keras.layers import Conv1D, MaxPooling1D, Flatten, GlobalAveragePooling1D, Attention
@@ -27,6 +28,9 @@ class LSTMModel:
         self.target_index = self.features.index('Close') if 'Close' in self.features else 0
         np.random.seed(42)
         tf.random.set_seed(42)
+        self.directional_alpha = 1.0
+        self.direction_model = None
+        self.tabular_model = None
 
     def create_features(self, df, for_training=True):
         df = df.copy()

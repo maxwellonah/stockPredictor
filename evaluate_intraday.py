@@ -60,24 +60,25 @@ def evaluate_rf_intraday(df, horizon_steps=30, test_size=0.2, random_state=42):
 
 
 def evaluate_lstm_intraday(df, horizon_steps=120, test_size=0.2, epochs=3, batch_size=64, time_steps=60):
-    d = df.copy().dropna(subset=["Close"]).reset_index(drop=True)
+    d = df.copy()
+    d["Target"] = d["Close"].shift(-horizon_steps)
+    d = d.dropna().reset_index(drop=True)
 
     split = int(len(d) * (1.0 - test_size))
     train_df = d.iloc[:split].copy()
     test_df = d.iloc[split:].copy()
 
     features = [
-        "Close",
-        "Volume",
-        "MA7",
-        "MA20",
-        "RSI",
-        "MACD",
-        "Sentiment_Score",
-        "Sentiment_Magnitude",
-        "Sentiment_Volume",
-        "Sentiment_Trend",
-        "Sentiment_Volatility",
+        'Close', 'Open', 'High', 'Low', 'Volume',
+        'Return', 'Log_Return', 'Volume_Change',
+        'MA7', 'MA14', 'MA21', 'MA50',
+        'Volatility7', 'Volatility14', 'Volatility21',
+        'RSI', 'RSI_Trend', 'MACD', 'MACD_Signal', 'MACD_Hist',
+        'BB_width', 'BB_position',
+        'Momentum7', 'Momentum14', 'Momentum21',
+        'Price_to_MA50',
+        'Day_of_Week', 'Month',
+        'Sentiment_Score', 'Sentiment_Magnitude', 'Sentiment_Volume', 'Sentiment_Trend', 'Sentiment_Volatility'
     ]
 
     model = LSTMModel(
@@ -90,58 +91,21 @@ def evaluate_lstm_intraday(df, horizon_steps=120, test_size=0.2, epochs=3, batch
 
     model.train(train_df)
 
-    # Build evaluation sequences using context from end of train so sequences span boundary
-    df_train_feat = model.create_features(train_df)
     df_test_feat = model.create_features(test_df)
+    eval_df = df_test_feat.copy()
+    eval_df['Target_Close'] = eval_df['Close'].shift(-horizon_steps)
+    eval_df = eval_df.dropna().reset_index(drop=True)
 
-    context_len = time_steps + horizon_steps
-    tail = df_train_feat.iloc[-context_len:].copy() if len(df_train_feat) >= context_len else df_train_feat.copy()
-    combined_close = np.concatenate([
-        tail['Close'].values,
-        df_test_feat['Close'].values,
-    ], axis=0)
+    X_test = eval_df[model.features].values
+    y_test_inv = eval_df['Target_Close'].values
+    base_prices = eval_df['Close'].values
 
-    combined = np.concatenate([
-        model.scaler.transform(tail[model.features].values),
-        model.scaler.transform(df_test_feat[model.features].values),
-    ], axis=0)
+    y_pred_inv = model.tabular_model.predict(X_test)
 
-    # Create sequences from combined, but keep only those whose target falls inside test region
-    X_all, y_all = model.create_sequences(combined)
-
-    # In create_sequences, y index is i + time_steps + horizon_steps
-    # Combined index mapping:
-    # - tail occupies [0, tail_len)
-    # - test occupies [tail_len, tail_len + len(test_feat))
-    tail_len = len(tail)
-    test_start = tail_len
-
-    seq_indices = np.arange(len(y_all))
-    target_indices = seq_indices + time_steps + horizon_steps
-    mask = target_indices >= test_start
-    X_test = X_all[mask]
-    y_test = y_all[mask]
-
-    # Base price for directional accuracy: last close of the input window
-    base_indices = (seq_indices + time_steps - 1)[mask]
-    base_prices = combined_close[base_indices]
-
-    y_pred = model.model.predict(X_test, verbose=0).flatten()
-
-    # Inverse transform predictions and actual values
-    dummy = np.zeros((len(y_pred), len(model.features)))
-    dummy[:, model.target_index] = y_pred
-    y_pred_inv = model.scaler.inverse_transform(dummy)[:, model.target_index]
-
-    dummy = np.zeros((len(y_test), len(model.features)))
-    dummy[:, model.target_index] = y_test
-    y_test_inv = model.scaler.inverse_transform(dummy)[:, model.target_index]
-
-    mse = float(np.mean((y_pred_inv - y_test_inv) ** 2))
-    rmse = float(np.sqrt(mse))
-    mae = float(mean_absolute_error(y_test_inv, y_pred_inv))
-    mape = float(np.mean(np.abs((y_test_inv - y_pred_inv) / y_test_inv)) * 100.0)
-    dir_acc = _directional_accuracy(y_test_inv, y_pred_inv, base_price=base_prices)
+    if model.direction_model is not None:
+        dir_up = model.direction_model.predict(X_test)
+        y_pred_inv = np.where((dir_up == 1) & (y_pred_inv < base_prices), base_prices + np.abs(y_pred_inv - base_prices), y_pred_inv)
+        y_pred_inv = np.where((dir_up == 0) & (y_pred_inv > base_prices), base_prices - np.abs(y_pred_inv - base_prices), y_pred_inv)
 
     out = {
         "rows": int(len(d)),
