@@ -19,18 +19,68 @@ from sentiment_charts import create_sentiment_history_chart, create_sentiment_su
 # Load environment variables
 load_dotenv()
 POLYGON_API_KEY = os.environ.get('POLYGON_API_KEY', "mo0_G1UPGqllOOPmY37UvS9Ui6mpiPQL")
+MAX_FETCH_DATA_AGE_MINUTES = 5000
+FETCH_LOOKBACK_DAYS = 7
 
 # Initialize the Dash app with a Bootstrap theme
 app = Dash(__name__, external_stylesheets=[dbc.themes.FLATLY], suppress_callback_exceptions=True)
 server = app.server
 
-# Define stock options
+# Define instrument options
 STOCK_OPTIONS = [
     {'label': 'Google (GOOGL)', 'value': 'GOOGL'},
     {'label': 'Apple (AAPL)', 'value': 'AAPL'},
     {'label': 'Microsoft (MSFT)', 'value': 'MSFT'},
-    {'label': 'Amazon (AMZN)', 'value': 'AMZN'}
+    {'label': 'Amazon (AMZN)', 'value': 'AMZN'},
+    {'label': 'BTC/USDT', 'value': 'BTC/USDT'},
+    {'label': 'ETH/USDT', 'value': 'ETH/USDT'},
+    {'label': 'SOL/USDT', 'value': 'SOL/USDT'},
+    {'label': 'DOGE/USDT', 'value': 'DOGE/USDT'},
+    {'label': 'ARB/USDT', 'value': 'ARB/USDT'},
+    {'label': 'EUR/USD', 'value': 'EUR/USD'},
+    {'label': 'GBP/USD', 'value': 'GBP/USD'},
+    {'label': 'USD/JPY', 'value': 'USD/JPY'},
+    {'label': 'AUD/USD', 'value': 'AUD/USD'}
 ]
+
+# Map UI symbols to Polygon symbols.
+# Note: Polygon has deep USD markets; USDT pairs are mapped to USD instruments.
+POLYGON_SYMBOL_MAP = {
+    'GOOGL': 'GOOGL',
+    'AAPL': 'AAPL',
+    'MSFT': 'MSFT',
+    'AMZN': 'AMZN',
+    'BTC/USDT': 'X:BTCUSD',
+    'ETH/USDT': 'X:ETHUSD',
+    'SOL/USDT': 'X:SOLUSD',
+    'DOGE/USDT': 'X:DOGEUSD',
+    'ARB/USDT': 'X:ARBUSD',
+    'EUR/USD': 'C:EURUSD',
+    'GBP/USD': 'C:GBPUSD',
+    'USD/JPY': 'C:USDJPY',
+    'AUD/USD': 'C:AUDUSD',
+}
+
+
+def resolve_market_symbol(ui_symbol):
+    symbol = (ui_symbol or 'GOOGL').strip().upper()
+    polygon_symbol = POLYGON_SYMBOL_MAP.get(symbol, symbol)
+    return symbol, polygon_symbol
+
+
+def add_default_sentiment_columns(df):
+    df = df.copy()
+    defaults = {
+        'Sentiment_Score': 0.0,
+        'Sentiment_Magnitude': 0.0,
+        'Sentiment_Volume': 0.0,
+        'Sentiment_Trend': 0.0,
+        'Sentiment_Volatility': 0.0,
+    }
+    for col, val in defaults.items():
+        if col not in df.columns:
+            df[col] = val
+    return df
 
 # Create directory for uploaded files
 os.makedirs('uploads', exist_ok=True)
@@ -77,10 +127,13 @@ def fetch_stock_data(ticker, timespan='minute', multiplier=1, from_date=None, to
     if to_date is None:
         to_date = datetime.now().strftime('%Y-%m-%d')
     
-    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{from_date}/{to_date}?apiKey={POLYGON_API_KEY}"
+    url = (
+        f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{from_date}/{to_date}"
+        f"?adjusted=true&sort=asc&limit=50000&apiKey={POLYGON_API_KEY}"
+    )
     
     try:
-        response = requests.get(url)
+        response = requests.get(url, timeout=30)
         if not response.ok:
             print(f"Error fetching stock data: HTTP {response.status_code} - {response.text}")
             return None
@@ -109,6 +162,7 @@ def fetch_stock_data(ticker, timespan='minute', multiplier=1, from_date=None, to
         
         # Select and reorder columns
         df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+        df = df.sort_values('Date').drop_duplicates(subset=['Date']).reset_index(drop=True)
         
         return df
     
@@ -320,7 +374,7 @@ app.layout = dbc.Container([
                 dbc.CardBody([
                     dbc.Tabs([
                         dbc.Tab([
-                            html.P("Select a stock to analyze:", className="mt-2"),
+                            html.P("Select an instrument to analyze:", className="mt-2"),
                             dcc.Dropdown(
                                 id="stock-dropdown",
                                 options=STOCK_OPTIONS,
@@ -515,29 +569,70 @@ def update_output(contents, filename):
 )
 def fetch_data(n_clicks, ticker):
     if n_clicks is None:
-        return html.Div("Click 'Fetch Data' to load stock information."), None
+        return html.Div("Click 'Fetch Data' to load market data."), None
 
     if not ticker:
         ticker = 'GOOGL'
+
+    ui_symbol, polygon_symbol = resolve_market_symbol(ticker)
+    click_time_utc = datetime.utcnow()
+    from_date = (click_time_utc - timedelta(days=FETCH_LOOKBACK_DAYS)).strftime('%Y-%m-%d')
+    to_date = click_time_utc.strftime('%Y-%m-%d')
     
     # Fetch 1-minute bars
-    df = fetch_stock_data(ticker, timespan='minute', multiplier=1)
+    df = fetch_stock_data(
+        polygon_symbol,
+        timespan='minute',
+        multiplier=1,
+        from_date=from_date,
+        to_date=to_date,
+    )
     
     if df is None:
-        return html.Div(f"Error fetching data for {ticker}. Check server logs for Polygon API details and confirm your API key has access."), None
+        return html.Div(
+            f"Error fetching data for {ui_symbol} (Polygon: {polygon_symbol}). "
+            "Check server logs for Polygon API details and confirm your API key has access."
+        ), None
+
+    if df.empty:
+        return html.Div(
+            f"No data returned for {ui_symbol} (Polygon: {polygon_symbol})."
+        ), None
+
+    latest_ts = pd.to_datetime(df['Date']).max()
+    if hasattr(latest_ts, "tzinfo") and latest_ts.tzinfo is not None:
+        latest_ts = latest_ts.tz_convert("UTC").tz_localize(None)
+    age_minutes = (click_time_utc - latest_ts.to_pydatetime()).total_seconds() / 60.0
+    if age_minutes > MAX_FETCH_DATA_AGE_MINUTES:
+        return html.Div([
+            html.P(
+                f"Data freshness check failed for {ui_symbol} (Polygon: {polygon_symbol}).",
+                className="text-danger"
+            ),
+            html.P(
+                f"Latest bar is {age_minutes:.1f} minutes old (max allowed: {MAX_FETCH_DATA_AGE_MINUTES} minutes)."
+            ),
+            html.P(f"Latest timestamp: {latest_ts} UTC"),
+            html.P("Try again when the market is active or use a lower-latency data plan.")
+        ]), None
     
     # Add time-aligned sentiment before technical indicators
-    df = add_time_aligned_sentiment(df, ticker)
+    df = add_time_aligned_sentiment(df, ui_symbol)
+    df = add_default_sentiment_columns(df)
+    df['Ticker'] = ui_symbol
 
     # Calculate technical indicators
     df_with_indicators = calculate_technical_indicators(df)
     
     # Save file
-    file_path = os.path.join('uploads', f"{ticker}_data.csv")
+    safe_symbol = ui_symbol.replace("/", "_").replace(":", "_")
+    file_path = os.path.join('uploads', f"{safe_symbol}_data.csv")
     df.to_csv(file_path, index=False)
     
     return html.Div([
-        html.P(f"Data fetched for {ticker}"),
+        html.P(f"Data fetched for {ui_symbol}"),
+        html.P(f"Market source symbol: {polygon_symbol}"),
+        html.P(f"Latest bar: {latest_ts} UTC ({max(age_minutes, 0.0):.1f} minutes old)"),
         html.P(f"Date range: {df['Date'].min().date()} to {df['Date'].max().date()}"),
         html.P(f"Number of records: {len(df)}")
     ]), df_with_indicators.to_json(date_format='iso', orient='split')
@@ -729,7 +824,7 @@ def train_models(n_clicks, data):
     lstm_model, lstm_history = train_lstm_model(df, "lstm-status")
     if lstm_model is not None:
         lstm_status = "AI 2-Hour Model: Trained"
-        lstm_model_info = {"model_path": "models/lstm_model.h5", "history": str(lstm_history)}
+        lstm_model_info = {"model_path": "models/lstm_model.h5", "history": lstm_history}
     else:
         lstm_status = f"AI 2-Hour Model: Error - {lstm_history.get('error', 'Unknown error')}"
         lstm_model_info = None
@@ -897,73 +992,30 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info):
     # LSTM Predictions
     if lstm_model_info is not None:
         try:
-            # Check if LSTM model file exists
-            model_path = "models/lstm_model.h5"
-            if os.path.exists(model_path) or os.path.exists(model_path.replace('.h5', '.keras')):
-                # Load LSTM model
-                print("Loading LSTM model...")
-                lstm_model = LSTMModel.load(model_path)
-                
-                # Force using the main prediction code
-                print("Making LSTM prediction...")
-                # Make predictions with sentiment features - now returns a dictionary with uncertainty
-                prediction_info = lstm_model.predict(df, sentiment_features=sentiment_features)
-                print(f"LSTM prediction info: {prediction_info.keys() if isinstance(prediction_info, dict) else 'not a dict'}")
-                
-                # Extract prediction details
-                if isinstance(prediction_info, dict):
-                    # New format with uncertainty information
-                    next_month_price = prediction_info['predicted_price']
-                    lower_bound, upper_bound = prediction_info['confidence_interval']
-                    uncertainty = prediction_info['uncertainty']
-                    prediction_method = prediction_info.get('method', 'lstm_model')
-                    print(f"Using prediction method: {prediction_method}")
-                else:
-                    # Handle old format for backward compatibility
-                    next_month_price = prediction_info
-                    # Estimate uncertainty as 10% of the prediction
-                    uncertainty = next_month_price * 0.1
-                    lower_bound = next_month_price * 0.9
-                    upper_bound = next_month_price * 1.1
-                    prediction_method = 'lstm_model_legacy'
-                    print("Using legacy prediction format")
-            else:
-                # Create a simple prediction based on the last price with a small increase
-                # This is a fallback when the model file doesn't exist
-                print(f"LSTM model file not found at {model_path} or {model_path.replace('.h5', '.keras')}")
-                print("Using simple fallback prediction")
-                
-                # Train a minimal model on the fly
-                try:
-                    print("Attempting to train a minimal LSTM model on the fly...")
-                    features = ['Close', 'Volume', 'High', 'Low', 'Open']
-                    minimal_model = LSTMModel(time_steps=30, features=features, epochs=3, horizon_steps=120)
-                    minimal_model.train(df)
-                    prediction_info = minimal_model.predict(df, sentiment_features=sentiment_features)
-                    
-                    if isinstance(prediction_info, dict):
-                        next_month_price = prediction_info['predicted_price']
-                        lower_bound, upper_bound = prediction_info['confidence_interval']
-                        uncertainty = prediction_info['uncertainty']
-                        prediction_method = prediction_info.get('method', 'lstm_minimal')
-                        print(f"Successfully used minimal model: {prediction_method}")
-                    else:
-                        raise ValueError("Minimal model did not return dictionary format")
-                except Exception as e:
-                    print(f"Error training minimal model: {str(e)}")
-                    # Ultimate fallback
-                    last_price = df['Close'].iloc[-1]
-                    next_month_price = last_price * 1.05  # 5% increase as a placeholder
-                    uncertainty = next_month_price * 0.15  # Higher uncertainty for fallback
-                    lower_bound = next_month_price * 0.85
-                    upper_bound = next_month_price * 1.15
-                    prediction_method = 'simple_fallback'
-                    print("Using ultimate simple fallback")
-            
-            # Save the model after successful prediction
-            if 'lstm_model' in locals() and lstm_model.model is not None:
-                print("Saving LSTM model after successful prediction")
-                lstm_model.save(model_path)
+            model_path = lstm_model_info.get("model_path", "models/lstm_model.h5")
+            print(f"Loading LSTM model from {model_path}...")
+            lstm_model = LSTMModel.load(model_path)
+
+            # Require trained model artifacts only (no ad-hoc fallback/minimal predictions).
+            if lstm_model.model is None and lstm_model.tabular_model is None:
+                raise ValueError("No trained LSTM artifacts available. Train and evaluate models before predicting.")
+
+            print("Making LSTM prediction...")
+            prediction_info = lstm_model.predict(df, sentiment_features=sentiment_features)
+            if not isinstance(prediction_info, dict):
+                raise ValueError("Unexpected prediction payload from trained LSTM model.")
+
+            prediction_method = prediction_info.get('method', 'unknown')
+            disallowed_methods = {'fallback_model', 'simple_fallback', 'lstm_constant', 'lstm_model_minimal', 'lstm_minimal'}
+            if prediction_method in disallowed_methods:
+                raise ValueError(
+                    f"Prediction blocked: method '{prediction_method}' is a fallback path, not the trained/evaluated model."
+                )
+
+            next_month_price = prediction_info['predicted_price']
+            lower_bound, upper_bound = prediction_info['confidence_interval']
+            uncertainty = prediction_info['uncertainty']
+            print(f"Using prediction method: {prediction_method}")
             
             # Current price
             last_price = df['Close'].iloc[-1]
@@ -1096,21 +1148,28 @@ def update_sentiment_analysis(data, selected_stock):
         return empty_cards, empty_fig
     
     try:
-        df = pd.read_json(data, orient='split')
+        _ = pd.read_json(data, orient='split')
         ticker = selected_stock or 'GOOGL'
-        
-        # Get sentiment features
-        analyzer = NewsSentimentAnalyzer()
-        sentiment_features = analyzer.get_sentiment_features(ticker, days=30)
-        
-        # Create summary cards
+
+        sentiment_features = {
+            'sentiment_score': 0.0,
+            'sentiment_magnitude': 0.0,
+            'sentiment_volume': 0,
+            'sentiment_trend': 0.0,
+            'sentiment_volatility': 0.0,
+        }
+
+        try:
+            analyzer = NewsSentimentAnalyzer()
+            fetched = analyzer.get_sentiment_features(ticker, days=30)
+            if isinstance(fetched, dict):
+                sentiment_features.update(fetched)
+        except Exception as e:
+            print(f"Sentiment fallback for {ticker}: {str(e)}")
+
         cards = create_sentiment_summary_cards(sentiment_features)
-        
-        # Create sentiment history chart
         chart = create_sentiment_history_chart(ticker, days=90)
-        
         return cards, chart
-        
     except Exception as e:
         error_cards = [dbc.Card(dbc.CardBody([html.P(f"Error: {str(e)}")]), color="light") for _ in range(4)]
         error_fig = go.Figure().add_annotation(

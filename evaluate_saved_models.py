@@ -1,12 +1,11 @@
 import os
 import pandas as pd
 import numpy as np
-import joblib
-import tensorflow as tf
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
+from rf_model import EnhancedRandomForestModel
+from lstm_model import LSTMModel
 
 def load_data():
     """Load the GOOGL stock data"""
@@ -17,19 +16,7 @@ def load_data():
         df = pd.read_csv(data_path)
         df['Date'] = pd.to_datetime(df['Date'])
         df = df.sort_values('Date')
-        
-        # Basic feature engineering
-        df['Return'] = df['Close'].pct_change()
-        df['Volume_Change'] = df['Volume'].pct_change()
-        df['MA7'] = df['Close'].rolling(7).mean()
-        df['MA21'] = df['Close'].rolling(21).mean()
-        df['MA50'] = df['Close'].rolling(50).mean()
-        
-        # Target: Next day's close price
-        df['Target'] = df['Close'].shift(-1)
-        
-        # Drop rows with missing values
-        df = df.dropna()
+        df = df.dropna(subset=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])
         
         print(f"Loaded {len(df)} rows of data")
         return df
@@ -42,16 +29,19 @@ def evaluate_random_forest(model_path, test_data):
     """Evaluate the Random Forest model"""
     print("\n=== Random Forest Model Evaluation ===")
     try:
-        # Load the model
-        model = joblib.load(model_path)
+        # Load the same model class used by the UI
+        model = EnhancedRandomForestModel.load_model(model_path)
         print(f"Loaded Random Forest model from {model_path}")
-        
-        # Prepare test data
-        X_test = test_data[['Close', 'Volume', 'MA7', 'MA21', 'MA50', 'Return', 'Volume_Change']]
-        y_test = test_data['Target']
-        
-        # Make predictions
-        y_pred = model.predict(X_test)
+
+        feats_test = model.create_features(test_data)
+        X_test = feats_test.drop(columns=["Date", "Close", "Next_Day_Close"], errors="ignore")
+        X_test = X_test.reindex(columns=model.feature_columns, fill_value=0)
+        if model.selected_features is not None:
+            X_test = X_test[model.selected_feature_names]
+
+        y_test = feats_test["Next_Day_Close"].values
+        y_pred = model.pipeline.predict(X_test.values)
+        base_prices = feats_test["Close"].values
         
         # Calculate metrics
         mae = mean_absolute_error(y_test, y_pred)
@@ -60,8 +50,8 @@ def evaluate_random_forest(model_path, test_data):
         mape = np.mean(np.abs((y_test - y_pred) / y_test)) * 100
         
         # Directional accuracy
-        actual_direction = np.sign(y_test.diff().dropna())
-        pred_direction = np.sign(np.diff(y_pred))
+        actual_direction = np.sign(y_test - base_prices)
+        pred_direction = np.sign(y_pred - base_prices)
         direction_match = (actual_direction == pred_direction).mean() * 100
         
         print("\nPerformance Metrics:")
@@ -72,15 +62,15 @@ def evaluate_random_forest(model_path, test_data):
         print(f"Directional Accuracy: {direction_match:.2f}%")
         
         # Feature importance
-        if hasattr(model, 'feature_importances_'):
+        if hasattr(model, 'pipeline') and hasattr(model.pipeline, 'feature_importances_'):
             print("\nFeature Importances:")
             features = X_test.columns
-            importances = model.feature_importances_
+            importances = model.pipeline.feature_importances_
             for feature, importance in sorted(zip(features, importances), key=lambda x: x[1], reverse=True):
                 print(f"{feature}: {importance:.4f}")
         
         # Plot predictions vs actual
-        plot_predictions(test_data['Date'], y_test, y_pred, 'Random Forest')
+        plot_predictions(feats_test['Date'], y_test, y_pred, 'Random Forest')
         
         return {
             'mae': mae,
@@ -98,21 +88,27 @@ def evaluate_lstm(model_path, test_data):
     """Evaluate the LSTM model"""
     print("\n=== LSTM Model Evaluation ===")
     try:
-        # Load the model
-        model = tf.keras.models.load_model(model_path)
+        # Load the same model class used by the UI
+        model = LSTMModel.load(model_path)
         print(f"Loaded LSTM model from {model_path}")
-        
-        # Prepare test data (simplified - in practice, you'd need to preprocess the same way as during training)
-        # This is a simplified evaluation - you'll need to adjust based on your LSTM's input requirements
-        X_test = test_data[['Close']].values
-        y_test = test_data['Target'].values
-        
-        # Reshape for LSTM (samples, time_steps, features)
-        # Note: This is simplified - adjust based on your model's expected input shape
-        X_test_reshaped = X_test.reshape((X_test.shape[0], 1, X_test.shape[1]))
-        
-        # Make predictions
-        y_pred = model.predict(X_test_reshaped).flatten()
+
+        if model.tabular_model is None:
+            raise ValueError("Loaded LSTM artifact does not contain the tabular horizon model.")
+
+        df_feat = model.create_features(test_data)
+        eval_df = df_feat.copy()
+        eval_df['Target_Close'] = eval_df['Close'].shift(-model.horizon_steps)
+        eval_df = eval_df.dropna().reset_index(drop=True)
+
+        X_test = eval_df[model.features].values
+        y_test = eval_df['Target_Close'].values
+        base_prices = eval_df['Close'].values
+
+        y_pred = model.tabular_model.predict(X_test)
+        if model.direction_model is not None:
+            dir_up = model.direction_model.predict(X_test)
+            y_pred = np.where((dir_up == 1) & (y_pred < base_prices), base_prices + np.abs(y_pred - base_prices), y_pred)
+            y_pred = np.where((dir_up == 0) & (y_pred > base_prices), base_prices - np.abs(y_pred - base_prices), y_pred)
         
         # Calculate metrics
         mae = mean_absolute_error(y_test, y_pred)
@@ -121,8 +117,8 @@ def evaluate_lstm(model_path, test_data):
         mape = np.mean(np.abs((y_test - y_pred) / y_test)) * 100
         
         # Directional accuracy
-        actual_direction = np.sign(np.diff(y_test))
-        pred_direction = np.sign(np.diff(y_pred))
+        actual_direction = np.sign(y_test - base_prices)
+        pred_direction = np.sign(y_pred - base_prices)
         direction_match = (actual_direction == pred_direction).mean() * 100
         
         print("\nPerformance Metrics:")
@@ -133,7 +129,7 @@ def evaluate_lstm(model_path, test_data):
         print(f"Directional Accuracy: {direction_match:.2f}%")
         
         # Plot predictions vs actual
-        plot_predictions(test_data['Date'], y_test, y_pred, 'LSTM')
+        plot_predictions(eval_df['Date'], y_test, y_pred, 'LSTM')
         
         return {
             'mae': mae,
@@ -202,7 +198,7 @@ if __name__ == "__main__":
     
     # Evaluate models
     rf_metrics = evaluate_random_forest('models/rf_model.joblib', test_data)
-    lstm_metrics = evaluate_lstm('models/simple_lstm_model.h5', test_data)
+    lstm_metrics = evaluate_lstm('models/lstm_model.h5', test_data)
     
     # Compare models if both evaluations were successful
     if rf_metrics and lstm_metrics:

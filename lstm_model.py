@@ -810,18 +810,21 @@ class LSTMModel:
         # Make sure the directory exists
         os.makedirs(os.path.dirname(keras_path), exist_ok=True)
         
-        # Save the model
-        try:
-            self.model.save(keras_path)
-            print(f"Model saved successfully to {keras_path}")
-        except Exception as e:
-            print(f"Error saving model: {str(e)}")
-            # Try alternative saving method
+        # Save the deep model only when it exists; tabular-only training is supported.
+        if self.model is not None:
             try:
-                self.model.save_weights(keras_path + '_weights')
-                print(f"Model weights saved to {keras_path}_weights")
-            except Exception as e2:
-                print(f"Error saving model weights: {str(e2)}")
+                self.model.save(keras_path)
+                print(f"Model saved successfully to {keras_path}")
+            except Exception as e:
+                print(f"Error saving model: {str(e)}")
+                # Try alternative saving method
+                try:
+                    self.model.save_weights(keras_path + '_weights')
+                    print(f"Model weights saved to {keras_path}_weights")
+                except Exception as e2:
+                    print(f"Error saving model weights: {str(e2)}")
+        else:
+            print("No deep model instance to save; saving tabular metadata only.")
         
         # Save metadata
         try:
@@ -887,53 +890,64 @@ class LSTMModel:
         else:
             keras_path = path
             
-        # Check if model file exists
-        if not os.path.exists(keras_path):
-            print(f"Warning: Model file {keras_path} not found.")
-            # Check if weights file exists as fallback
-            if os.path.exists(keras_path + '_weights.index'):
-                print(f"Found weights file, will load weights instead.")
-            else:
-                print(f"No model or weights file found at {keras_path}")
-                # Return an untrained model instance with force_main_prediction=True
-                model = cls()
-                return model
-        
-        # Check if metadata file exists
         meta_path = keras_path + '_meta.pkl'
-        if not os.path.exists(meta_path):
-            print(f"Warning: Metadata file {meta_path} not found.")
-            # Return an untrained model instance with force_main_prediction=True
-            model = cls()
-            return model
+        has_model_file = os.path.exists(keras_path) or os.path.exists(keras_path + '_weights.index')
+        has_metadata = os.path.exists(meta_path)
+        if not has_model_file and not has_metadata:
+            print(f"Warning: Neither model artifact nor metadata found for {keras_path}")
+            return cls()
         
         try:
-            # Load model
-            model = cls()
+            metadata = None
+            if has_metadata:
+                metadata = joblib.load(meta_path)
+
+            if metadata and 'config' in metadata:
+                cfg = metadata['config']
+                model = cls(
+                    time_steps=cfg.get('time_steps', 60),
+                    features=metadata.get('features'),
+                    horizon_steps=cfg.get('horizon_steps', 120),
+                )
+            else:
+                model = cls()
+
+            # Load deep model if available (optional for tabular-only training)
             if os.path.exists(keras_path):
-                model.model = tf.keras.models.load_model(keras_path)
-                print(f"Model loaded successfully from {keras_path}")
+                try:
+                    model.model = tf.keras.models.load_model(keras_path)
+                    print(f"Model loaded successfully from {keras_path}")
+                except Exception as model_load_error:
+                    model.model = None
+                    print(f"Warning: Could not load deep model at {keras_path}: {model_load_error}")
             elif os.path.exists(keras_path + '_weights.index'):
                 # If only weights exist, create model architecture and load weights
                 # This requires building the model first
-                features = ['Close', 'Volume', 'High', 'Low', 'Open']  # Default features
-                model = cls(features=features)
-                dummy_data = np.random.random((1, model.time_steps, len(features)))
-                model.build_model((model.time_steps, len(features)))
-                model.model.predict(dummy_data)  # Initialize weights
-                model.model.load_weights(keras_path + '_weights')
-                print(f"Model weights loaded from {keras_path}_weights")
+                try:
+                    weights_features = model.features if model.features else ['Close', 'Volume', 'High', 'Low', 'Open']
+                    model.features = weights_features
+                    dummy_data = np.random.random((1, model.time_steps, len(weights_features)))
+                    model.build_model((model.time_steps, len(weights_features)))
+                    model.model.predict(dummy_data)  # Initialize weights
+                    model.model.load_weights(keras_path + '_weights')
+                    print(f"Model weights loaded from {keras_path}_weights")
+                except Exception as weights_load_error:
+                    model.model = None
+                    print(f"Warning: Could not load weights at {keras_path}_weights: {weights_load_error}")
             
-            # Load metadata
-            meta = joblib.load(meta_path)
-            model.scaler = meta['scaler']
-            model.features = meta['features']
-            model.time_steps = meta['config']['time_steps']
-            model.horizon_steps = meta['config'].get('horizon_steps', model.horizon_steps)
-            model.target_index = meta['config']['target_index']
-            model.tabular_model = meta.get('tabular_model')
-            model.direction_model = meta.get('direction_model')
-            print(f"Metadata loaded from {meta_path}")
+            # Load metadata if available
+            if metadata:
+                model.scaler = metadata.get('scaler')
+                model.features = metadata.get('features', model.features)
+                config = metadata.get('config', {})
+                model.time_steps = config.get('time_steps', model.time_steps)
+                model.horizon_steps = config.get('horizon_steps', model.horizon_steps)
+                model.target_index = config.get('target_index', model.target_index)
+                model.tabular_model = metadata.get('tabular_model')
+                model.direction_model = metadata.get('direction_model')
+                print(f"Metadata loaded from {meta_path}")
+            else:
+                print(f"Warning: Metadata file {meta_path} not found.")
             
             return model
         except Exception as e:

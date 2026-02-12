@@ -107,6 +107,12 @@ def evaluate_lstm_intraday(df, horizon_steps=120, test_size=0.2, epochs=3, batch
         y_pred_inv = np.where((dir_up == 1) & (y_pred_inv < base_prices), base_prices + np.abs(y_pred_inv - base_prices), y_pred_inv)
         y_pred_inv = np.where((dir_up == 0) & (y_pred_inv > base_prices), base_prices - np.abs(y_pred_inv - base_prices), y_pred_inv)
 
+    mse = float(mean_squared_error(y_test_inv, y_pred_inv))
+    rmse = float(np.sqrt(mse))
+    mae = float(mean_absolute_error(y_test_inv, y_pred_inv))
+    mape = float(np.mean(np.abs((y_test_inv - y_pred_inv) / y_test_inv)) * 100.0)
+    dir_acc = _directional_accuracy(y_test_inv, y_pred_inv, base_prices)
+
     out = {
         "rows": int(len(d)),
         "train_rows": int(len(train_df)),
