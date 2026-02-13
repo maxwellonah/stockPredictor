@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, time
 import requests
 import io
 from dotenv import load_dotenv
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 # Import models
 from rf_model import EnhancedRandomForestModel
@@ -329,6 +330,70 @@ def calculate_technical_indicators(df):
     
     return df
 
+
+def _directional_accuracy(y_true, y_pred, base_price):
+    actual_dir = np.sign(np.asarray(y_true) - np.asarray(base_price))
+    pred_dir = np.sign(np.asarray(y_pred) - np.asarray(base_price))
+    return float((actual_dir == pred_dir).mean() * 100.0)
+
+
+def _safe_mape(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    denom = np.maximum(np.abs(y_true), 1e-8)
+    return float(np.mean(np.abs((y_true - y_pred) / denom)) * 100.0)
+
+
+def evaluate_rf_holdout(model, df, test_size=0.2):
+    d = df.copy().dropna(subset=["Close"]).sort_values("Date").reset_index(drop=True)
+    full_feat = model.create_features(d)
+    split = int(len(full_feat) * (1.0 - test_size))
+    split = min(max(split, 1), len(full_feat) - 1)
+    eval_df = full_feat.iloc[split:].copy().reset_index(drop=True)
+
+    X_eval = eval_df.drop(columns=["Date", "Close", "Next_Day_Close"], errors="ignore")
+    y_true = eval_df["Next_Day_Close"].values.astype(float)
+    base = eval_df["Close"].values.astype(float)
+    y_pred = model.predict_from_features(X_eval, base, apply_direction=True)
+
+    return {
+        "rows": int(len(d)),
+        "train_rows": int(split),
+        "test_rows": int(len(eval_df)),
+        "mae": float(mean_absolute_error(y_true, y_pred)),
+        "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "r2": float(r2_score(y_true, y_pred)),
+        "mape": _safe_mape(y_true, y_pred),
+        "directional_accuracy": _directional_accuracy(y_true, y_pred, base),
+    }
+
+
+def evaluate_lstm_holdout(model, df, test_size=0.2):
+    d = df.copy().dropna(subset=["Close"]).sort_values("Date").reset_index(drop=True)
+    full_feat = model.create_features(d)
+    eval_columns = list(dict.fromkeys(model.features + ["Close"]))
+    eval_df = full_feat[eval_columns].copy()
+    eval_df["Target_Close"] = full_feat["Close"].shift(-model.horizon_steps)
+    eval_df = eval_df.dropna().reset_index(drop=True)
+    split = int(len(eval_df) * (1.0 - test_size))
+    split = min(max(split, 1), len(eval_df) - 1)
+    eval_df = eval_df.iloc[split:].copy().reset_index(drop=True)
+
+    y_true = eval_df["Target_Close"].values.astype(float)
+    base = eval_df["Close"].values.astype(float)
+    y_pred = model.predict_tabular_batch(eval_df).astype(float)
+
+    return {
+        "rows": int(len(d)),
+        "train_rows": int(split),
+        "test_rows": int(len(eval_df)),
+        "mae": float(mean_absolute_error(y_true, y_pred)),
+        "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "r2": float(r2_score(y_true, y_pred)),
+        "mape": _safe_mape(y_true, y_pred),
+        "directional_accuracy": _directional_accuracy(y_true, y_pred, base),
+    }
+
 # Function to train RF model
 def train_rf_model(df, status_div_id):
     """Train Random Forest model and return metrics"""
@@ -344,6 +409,7 @@ def train_rf_model(df, status_div_id):
         # Train model
         print("Training RF model...")
         metrics = rf_model.train(df, cv=3)
+        metrics["holdout"] = evaluate_rf_holdout(rf_model, df, test_size=0.2)
         
         # Ensure models directory exists
         os.makedirs('models', exist_ok=True)
@@ -405,6 +471,7 @@ def train_lstm_model(df, status_div_id):
         # Train model
         print("Training AI 2-Hour Model...")
         history = lstm_model.train(df)
+        history["holdout"] = evaluate_lstm_holdout(lstm_model, df, test_size=0.2)
         
         # Ensure models directory exists
         os.makedirs('models', exist_ok=True)
@@ -973,7 +1040,11 @@ def train_models(n_clicks, data):
     # Train RF model
     rf_model, rf_metrics = train_rf_model(df, "rf-status")
     if rf_model is not None:
-        rf_status = "AI 30-Min Model: Trained"
+        rf_holdout = rf_metrics.get("holdout", {})
+        rf_status = (
+            f"AI 30-Min Model: Trained (Test DA {rf_holdout.get('directional_accuracy', 0.0):.1f}% | "
+            f"R² {rf_holdout.get('r2', 0.0):.3f})"
+        )
         rf_model_info = {"model_path": "models/rf_model.joblib", "metrics": rf_metrics}
     else:
         rf_status = f"AI 30-Min Model: Error - {rf_metrics.get('error', 'Unknown error')}"
@@ -984,17 +1055,35 @@ def train_models(n_clicks, data):
     lstm_spinner_content = "Training AI 2-Hour Model"
     lstm_model, lstm_history = train_lstm_model(df, "lstm-status")
     if lstm_model is not None:
-        lstm_status = "AI 2-Hour Model: Trained"
-        lstm_model_info = {"model_path": "models/lstm_model.h5", "history": lstm_history}
+        lstm_holdout = lstm_history.get("holdout", {})
+        lstm_status = (
+            f"AI 2-Hour Model: Trained (Test DA {lstm_holdout.get('directional_accuracy', 0.0):.1f}% | "
+            f"R² {lstm_holdout.get('r2', 0.0):.3f})"
+        )
+        lstm_model_info = {
+            "model_path": "models/lstm_model.h5",
+            "history": lstm_history,
+            "metrics": lstm_history,
+        }
     else:
         lstm_status = f"AI 2-Hour Model: Error - {lstm_history.get('error', 'Unknown error')}"
         lstm_model_info = None
     
     # Show completion notification
     completion_notification = True
+    rf_holdout = (rf_metrics or {}).get("holdout", {})
+    lstm_holdout = (lstm_history or {}).get("holdout", {})
     completion_message = html.Div([
         html.H5("Training Complete!", className="mb-2"),
-        html.P("Both models have been successfully trained."),
+        html.P("Both models have been trained and chronologically tested (20% holdout)."),
+        html.P(
+            f"RF Test: DA {rf_holdout.get('directional_accuracy', 0.0):.1f}% | "
+            f"R² {rf_holdout.get('r2', 0.0):.3f} | RMSE {rf_holdout.get('rmse', 0.0):.3f}"
+        ),
+        html.P(
+            f"2-Hour Ensemble Test: DA {lstm_holdout.get('directional_accuracy', 0.0):.1f}% | "
+            f"R² {lstm_holdout.get('r2', 0.0):.3f} | RMSE {lstm_holdout.get('rmse', 0.0):.3f}"
+        ),
         html.P("You can now make predictions using the 'Predict' button.", className="mb-0")
     ])
     
@@ -1087,6 +1176,7 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info, selected_sy
             # Calculate change
             change = next_day_price - last_price
             pct_change = (change / last_price) * 100
+            rf_holdout = (rf_model_info.get("metrics", {}) or {}).get("holdout", {})
             
             # Create results display
             rf_results = html.Div([
@@ -1099,6 +1189,11 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info, selected_sy
                               style={"color": "green" if pct_change >= 0 else "red"}),
                     ")"
                 ]),
+                html.Hr(),
+                html.H6("Verified Test Metrics (20% Holdout)"),
+                html.P(f"Directional Accuracy: {rf_holdout.get('directional_accuracy', 0.0):.1f}%"),
+                html.P(f"R-squared (R²): {rf_holdout.get('r2', 0.0):.3f}"),
+                html.P(f"RMSE: {rf_holdout.get('rmse', 0.0):.3f}"),
                 html.Hr(),
                 html.H6("Sentiment Analysis", className="mt-3"),
                 html.P(f"Sentiment Score: {sentiment_features['sentiment_score']:.3f}"),
@@ -1190,6 +1285,9 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info, selected_sy
             # Format confidence interval
             confidence_range = f"${lower_bound:.2f} to ${upper_bound:.2f}"
             confidence_pct = (upper_bound - lower_bound) / next_month_price * 100
+            lstm_holdout = (
+                (lstm_model_info.get("metrics", {}) or lstm_model_info.get("history", {}) or {}).get("holdout", {})
+            )
             
             # Create results display with uncertainty information
             lstm_results = html.Div([
@@ -1205,6 +1303,11 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info, selected_sy
                 html.P(f"95% Confidence Interval: {confidence_range}"),
                 html.P(f"Uncertainty: ±{uncertainty:.2f} (±{confidence_pct:.1f}%)"),
                 html.P(f"Prediction Method: {prediction_method}", className="text-muted small"),
+                html.Hr(),
+                html.H6("Verified Test Metrics (20% Holdout)"),
+                html.P(f"Directional Accuracy: {lstm_holdout.get('directional_accuracy', 0.0):.1f}%"),
+                html.P(f"R-squared (R²): {lstm_holdout.get('r2', 0.0):.3f}"),
+                html.P(f"RMSE: {lstm_holdout.get('rmse', 0.0):.3f}"),
                 html.Hr(),
                 html.H6("Sentiment Analysis", className="mt-3"),
                 html.P(f"Sentiment Score: {sentiment_features['sentiment_score']:.3f}"),
