@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 from dash import Dash, html, dcc, Input, Output, State, callback, dash_table
 import dash_bootstrap_components as dbc
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 import requests
 import io
 from dotenv import load_dotenv
@@ -18,8 +18,9 @@ from sentiment_charts import create_sentiment_history_chart, create_sentiment_su
 
 # Load environment variables
 load_dotenv()
-POLYGON_API_KEY = os.environ.get('POLYGON_API_KEY', "mo0_G1UPGqllOOPmY37UvS9Ui6mpiPQL")
-MAX_FETCH_DATA_AGE_MINUTES = 5000
+FINNHUB_API_KEY = os.environ.get('FINNHUB_API_KEY', "d6747gpr01qmckkc2ig0d6747gpr01qmckkc2igg")
+TWELVE_DATA_API_KEY = os.environ.get('TWELVE_DATA_API_KEY', "22425aaff0ea4df09f0e4f1fb9791b9f")
+MAX_FETCH_DATA_AGE_MINUTES = 10
 FETCH_LOOKBACK_DAYS = 7
 
 # Initialize the Dash app with a Bootstrap theme
@@ -43,29 +44,63 @@ STOCK_OPTIONS = [
     {'label': 'AUD/USD', 'value': 'AUD/USD'}
 ]
 
-# Map UI symbols to Polygon symbols.
-# Note: Polygon has deep USD markets; USDT pairs are mapped to USD instruments.
-POLYGON_SYMBOL_MAP = {
-    'GOOGL': 'GOOGL',
-    'AAPL': 'AAPL',
-    'MSFT': 'MSFT',
-    'AMZN': 'AMZN',
-    'BTC/USDT': 'X:BTCUSD',
-    'ETH/USDT': 'X:ETHUSD',
-    'SOL/USDT': 'X:SOLUSD',
-    'DOGE/USDT': 'X:DOGEUSD',
-    'ARB/USDT': 'X:ARBUSD',
-    'EUR/USD': 'C:EURUSD',
-    'GBP/USD': 'C:GBPUSD',
-    'USD/JPY': 'C:USDJPY',
-    'AUD/USD': 'C:AUDUSD',
+# Provider routing:
+# - Finnhub: US equities
+# - Twelve Data: crypto + forex
+INSTRUMENT_CONFIG = {
+    'GOOGL': {'provider': 'finnhub', 'symbol': 'GOOGL', 'market_type': 'equity'},
+    'AAPL': {'provider': 'finnhub', 'symbol': 'AAPL', 'market_type': 'equity'},
+    'MSFT': {'provider': 'finnhub', 'symbol': 'MSFT', 'market_type': 'equity'},
+    'AMZN': {'provider': 'finnhub', 'symbol': 'AMZN', 'market_type': 'equity'},
+    'BTC/USDT': {'provider': 'twelve', 'symbol': 'BTC/USD', 'market_type': 'crypto'},
+    'ETH/USDT': {'provider': 'twelve', 'symbol': 'ETH/USD', 'market_type': 'crypto'},
+    'SOL/USDT': {'provider': 'twelve', 'symbol': 'SOL/USD', 'market_type': 'crypto'},
+    'DOGE/USDT': {'provider': 'twelve', 'symbol': 'DOGE/USD', 'market_type': 'crypto'},
+    'ARB/USDT': {'provider': 'twelve', 'symbol': 'ARB/USD', 'market_type': 'crypto'},
+    'EUR/USD': {'provider': 'twelve', 'symbol': 'EUR/USD', 'market_type': 'forex'},
+    'GBP/USD': {'provider': 'twelve', 'symbol': 'GBP/USD', 'market_type': 'forex'},
+    'USD/JPY': {'provider': 'twelve', 'symbol': 'USD/JPY', 'market_type': 'forex'},
+    'AUD/USD': {'provider': 'twelve', 'symbol': 'AUD/USD', 'market_type': 'forex'},
 }
 
 
 def resolve_market_symbol(ui_symbol):
     symbol = (ui_symbol or 'GOOGL').strip().upper()
-    polygon_symbol = POLYGON_SYMBOL_MAP.get(symbol, symbol)
-    return symbol, polygon_symbol
+    config = INSTRUMENT_CONFIG.get(symbol)
+    if config:
+        return symbol, config['provider'], config['symbol'], config['market_type']
+
+    # Fallbacks for unknown symbols.
+    if "/" in symbol:
+        normalized = symbol.replace("USDT", "USD")
+        market_type = 'crypto' if 'USDT' in symbol else 'forex'
+        return symbol, 'twelve', normalized, market_type
+    return symbol, 'finnhub', symbol, 'equity'
+
+
+def is_market_open(market_type, now_utc):
+    """Simple market-hours gate in UTC for freshness enforcement."""
+    weekday = now_utc.weekday()  # Monday=0 ... Sunday=6
+    t = now_utc.time()
+
+    if market_type == 'crypto':
+        return True  # 24/7
+
+    if market_type == 'equity':
+        # US equities regular hours in UTC (approx): Mon-Fri 14:30-21:00.
+        return weekday < 5 and (time(14, 30) <= t < time(21, 0))
+
+    if market_type == 'forex':
+        # Forex: Sun 22:00 UTC -> Fri 22:00 UTC.  
+        if weekday in (0, 1, 2, 3):
+            return True
+        if weekday == 4:
+            return t < time(22, 0)
+        if weekday == 6:
+            return t >= time(22, 0)
+        return False
+
+    return True
 
 
 def add_default_sentiment_columns(df):
@@ -113,62 +148,152 @@ def add_time_aligned_sentiment(df, ticker):
         print(f"Error merging sentiment timeseries: {str(e)}")
         return df
 
-# Function to fetch stock data from Polygon API
-def fetch_stock_data(ticker, timespan='minute', multiplier=1, from_date=None, to_date=None):
-    """Fetch stock data from Polygon API"""
+def _parse_dt(value, default, end_of_day=False):
+    if value is None:
+        return default
+    if isinstance(value, datetime):
+        return value
+    parsed = pd.to_datetime(value)
+    if isinstance(value, str) and len(value.strip()) == 10 and end_of_day:
+        parsed = parsed + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+    return parsed.to_pydatetime()
+
+
+def _standardize_ohlcv(df):
+    if df is None or df.empty:
+        return pd.DataFrame(columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])
+    out = df.copy()
+    out['Date'] = pd.to_datetime(out['Date'])
+    for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+        if col not in out.columns:
+            out[col] = 0
+        out[col] = pd.to_numeric(out[col], errors='coerce')
+
+    # Some providers/symbols do not supply meaningful volume (especially FX/crypto pairs).
+    # Keep a positive, non-zero series so downstream pct_change features remain valid.
+    vol = out['Volume'].fillna(0.0)
+    positive_vol = vol[vol > 0]
+    if positive_vol.empty:
+        out['Volume'] = 1.0
+    else:
+        fallback = float(positive_vol.median())
+        if fallback <= 0:
+            fallback = 1.0
+        out['Volume'] = vol.where(vol > 0, fallback)
+    out = out.dropna(subset=['Date', 'Open', 'High', 'Low', 'Close'])
+    out = out.sort_values('Date').drop_duplicates(subset=['Date']).reset_index(drop=True)
+    return out[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+
+
+def fetch_stock_data_finnhub(symbol, from_dt, to_dt):
+    if not FINNHUB_API_KEY:
+        print("FINNHUB_API_KEY is missing.")
+        return None
+    url = "https://finnhub.io/api/v1/stock/candle"
+    params = {
+        'symbol': symbol,
+        'resolution': '1',
+        'from': int(from_dt.timestamp()),
+        'to': int(to_dt.timestamp()),
+        'token': FINNHUB_API_KEY,
+    }
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = requests.get(url, params=params, timeout=20)
+            if not response.ok:
+                print(f"Error fetching Finnhub data: HTTP {response.status_code} - {response.text}")
+                return None
+            data = response.json()
+            if data.get('s') != 'ok' or not data.get('t'):
+                print(f"Finnhub returned no usable data for {symbol}: {data}")
+                return pd.DataFrame(columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])
+            df = pd.DataFrame({
+                'Date': pd.to_datetime(data.get('t', []), unit='s'),
+                'Open': data.get('o', []),
+                'High': data.get('h', []),
+                'Low': data.get('l', []),
+                'Close': data.get('c', []),
+                'Volume': data.get('v', []),
+            })
+            return _standardize_ohlcv(df)
+        except Exception as e:
+            last_error = e
+            print(f"Error fetching Finnhub data (attempt {attempt + 1}/3): {str(e)}")
+    print(f"Error fetching Finnhub data: {str(last_error)}")
+    return None
+
+
+def fetch_stock_data_twelve(symbol, from_dt, to_dt):
+    if not TWELVE_DATA_API_KEY:
+        print("TWELVE_DATA_API_KEY is missing.")
+        return None
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        'symbol': symbol,
+        'interval': '1min',
+        'start_date': from_dt.strftime('%Y-%m-%d %H:%M:%S'),
+        'end_date': to_dt.strftime('%Y-%m-%d %H:%M:%S'),
+        'timezone': 'UTC',
+        'order': 'ASC',
+        'outputsize': 2000,
+        'apikey': TWELVE_DATA_API_KEY,
+    }
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = requests.get(url, params=params, timeout=25)
+            if not response.ok:
+                print(f"Error fetching Twelve Data: HTTP {response.status_code} - {response.text}")
+                return None
+            data = response.json()
+            values = data.get('values', [])
+            if not values:
+                print(f"Twelve Data returned no usable data for {symbol}: {data}")
+                return pd.DataFrame(columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])
+            df = pd.DataFrame(values)
+            df = df.rename(columns={
+                'datetime': 'Date',
+                'open': 'Open',
+                'high': 'High',
+                'low': 'Low',
+                'close': 'Close',
+                'volume': 'Volume',
+            })
+            return _standardize_ohlcv(df)
+        except Exception as e:
+            last_error = e
+            print(f"Error fetching Twelve Data (attempt {attempt + 1}/3): {str(e)}")
+    print(f"Error fetching Twelve Data: {str(last_error)}")
+    return None
+
+
+def fetch_stock_data(ticker, timespan='minute', multiplier=1, from_date=None, to_date=None, provider=None):
+    """Fetch 1-minute market data from configured providers."""
     if not ticker:
         return None
 
-    if from_date is None:
-        if timespan == 'minute':
-            from_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+    now_dt = datetime.utcnow()
+    default_from = now_dt - timedelta(days=FETCH_LOOKBACK_DAYS)
+    from_dt = _parse_dt(from_date, default_from, end_of_day=False)
+    to_dt = _parse_dt(to_date, now_dt, end_of_day=True)
+    if to_dt <= from_dt:
+        to_dt = from_dt + timedelta(minutes=1)
+
+    provider_name = (provider or '').strip().lower()
+    if not provider_name:
+        if "/" in str(ticker):
+            provider_name = 'twelve'
         else:
-            from_date = (datetime.now() - timedelta(days=365*2)).strftime('%Y-%m-%d')
-    if to_date is None:
-        to_date = datetime.now().strftime('%Y-%m-%d')
-    
-    url = (
-        f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{from_date}/{to_date}"
-        f"?adjusted=true&sort=asc&limit=50000&apiKey={POLYGON_API_KEY}"
-    )
-    
-    try:
-        response = requests.get(url, timeout=30)
-        if not response.ok:
-            print(f"Error fetching stock data: HTTP {response.status_code} - {response.text}")
-            return None
+            provider_name = 'finnhub'
 
-        data = response.json()
+    if provider_name == 'finnhub':
+        return fetch_stock_data_finnhub(ticker, from_dt, to_dt)
+    if provider_name == 'twelve':
+        return fetch_stock_data_twelve(ticker, from_dt, to_dt)
 
-        if 'results' not in data:
-            print(f"Error fetching data: {data}")
-            return None
-        
-        # Convert to DataFrame
-        df = pd.DataFrame(data['results'])
-        
-        # Rename columns to match our model expectations
-        df = df.rename(columns={
-            'v': 'Volume',
-            'o': 'Open',
-            'c': 'Close',
-            'h': 'High',
-            'l': 'Low',
-            't': 'timestamp'
-        })
-        
-        # Convert timestamp to datetime
-        df['Date'] = pd.to_datetime(df['timestamp'], unit='ms')
-        
-        # Select and reorder columns
-        df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
-        df = df.sort_values('Date').drop_duplicates(subset=['Date']).reset_index(drop=True)
-        
-        return df
-    
-    except Exception as e:
-        print(f"Error fetching stock data: {str(e)}")
-        return None
+    print(f"Unknown provider '{provider_name}' for symbol {ticker}")
+    return None
 
 # Function to calculate technical indicators
 def calculate_technical_indicators(df):
@@ -211,7 +336,7 @@ def train_rf_model(df, status_div_id):
         print("Starting RF model training...")
         # Create model
         rf_model = EnhancedRandomForestModel(
-            feature_selection_threshold=0.0,
+            feature_selection_threshold=0.01,
             random_state=42,
             horizon_steps=30
         )
@@ -266,9 +391,16 @@ def train_lstm_model(df, status_div_id):
                 f"Available columns: {', '.join(df.columns)}"
             )
         
-        # Create model
+        # Create model with larger minute-history context for stronger regime coverage.
         print("Initializing LSTM model...")
-        lstm_model = LSTMModel(time_steps=90, features=features, epochs=80, batch_size=32, horizon_steps=120)
+        dynamic_time_steps = int(np.clip(len(df) // 8, 120, 240))
+        lstm_model = LSTMModel(
+            time_steps=dynamic_time_steps,
+            features=features,
+            epochs=120,
+            batch_size=32,
+            horizon_steps=120
+        )
         
         # Train model
         print("Training AI 2-Hour Model...")
@@ -383,7 +515,7 @@ app.layout = dbc.Container([
                             ),
                             dbc.Button("Fetch Data", id="fetch-data-btn", color="primary", className="mr-2"),
                             html.Div(id="api-data-info", className="mt-3")
-                        ], label="Polygon API"),
+                        ], label="Live Market API"),
                         
                         dbc.Tab([
                             html.P("Upload your own CSV file:", className="mt-2"),
@@ -574,52 +706,77 @@ def fetch_data(n_clicks, ticker):
     if not ticker:
         ticker = 'GOOGL'
 
-    ui_symbol, polygon_symbol = resolve_market_symbol(ticker)
+    ui_symbol, provider_name, provider_symbol, market_type = resolve_market_symbol(ticker)
     click_time_utc = datetime.utcnow()
-    from_date = (click_time_utc - timedelta(days=FETCH_LOOKBACK_DAYS)).strftime('%Y-%m-%d')
-    to_date = click_time_utc.strftime('%Y-%m-%d')
+    from_date = click_time_utc - timedelta(days=FETCH_LOOKBACK_DAYS)
+    to_date = click_time_utc
     
     # Fetch 1-minute bars
     df = fetch_stock_data(
-        polygon_symbol,
+        provider_symbol,
         timespan='minute',
         multiplier=1,
         from_date=from_date,
         to_date=to_date,
+        provider=provider_name,
     )
+
+    # Keep Finnhub as primary for stocks, but fail over to Twelve Data if access is denied.
+    if (df is None or df.empty) and provider_name == 'finnhub':
+        fallback_provider = 'twelve'
+        fallback_symbol = provider_symbol
+        fallback_df = fetch_stock_data(
+            fallback_symbol,
+            timespan='minute',
+            multiplier=1,
+            from_date=from_date,
+            to_date=to_date,
+            provider=fallback_provider,
+        )
+        if fallback_df is not None and not fallback_df.empty:
+            print(f"Finnhub fallback activated for {ui_symbol}: using Twelve Data.")
+            df = fallback_df
+            provider_name = f"{provider_name}->twelve"
+            provider_symbol = fallback_symbol
     
     if df is None:
         return html.Div(
-            f"Error fetching data for {ui_symbol} (Polygon: {polygon_symbol}). "
-            "Check server logs for Polygon API details and confirm your API key has access."
+            f"Error fetching data for {ui_symbol} "
+            f"(provider: {provider_name}, symbol: {provider_symbol}). "
+            "Check server logs and confirm API keys are valid."
         ), None
 
     if df.empty:
         return html.Div(
-            f"No data returned for {ui_symbol} (Polygon: {polygon_symbol})."
+            f"No data returned for {ui_symbol} "
+            f"(provider: {provider_name}, symbol: {provider_symbol})."
         ), None
 
     latest_ts = pd.to_datetime(df['Date']).max()
     if hasattr(latest_ts, "tzinfo") and latest_ts.tzinfo is not None:
         latest_ts = latest_ts.tz_convert("UTC").tz_localize(None)
     age_minutes = (click_time_utc - latest_ts.to_pydatetime()).total_seconds() / 60.0
-    if age_minutes > MAX_FETCH_DATA_AGE_MINUTES:
+    market_open = is_market_open(market_type, click_time_utc)
+    if market_open and age_minutes > MAX_FETCH_DATA_AGE_MINUTES:
         return html.Div([
             html.P(
-                f"Data freshness check failed for {ui_symbol} (Polygon: {polygon_symbol}).",
+                f"Data freshness check failed for {ui_symbol} "
+                f"(provider: {provider_name}, symbol: {provider_symbol}).",
                 className="text-danger"
             ),
             html.P(
                 f"Latest bar is {age_minutes:.1f} minutes old (max allowed: {MAX_FETCH_DATA_AGE_MINUTES} minutes)."
             ),
             html.P(f"Latest timestamp: {latest_ts} UTC"),
-            html.P("Try again when the market is active or use a lower-latency data plan.")
+            html.P(
+                f"Market is currently open for {market_type}, so strict freshness is enforced."
+            ),
+            html.P("Try again shortly or switch provider/data plan for lower latency.")
         ]), None
     
     # Add time-aligned sentiment before technical indicators
     df = add_time_aligned_sentiment(df, ui_symbol)
     df = add_default_sentiment_columns(df)
-    df['Ticker'] = ui_symbol
 
     # Calculate technical indicators
     df_with_indicators = calculate_technical_indicators(df)
@@ -631,8 +788,12 @@ def fetch_data(n_clicks, ticker):
     
     return html.Div([
         html.P(f"Data fetched for {ui_symbol}"),
-        html.P(f"Market source symbol: {polygon_symbol}"),
+        html.P(f"Provider: {provider_name}"),
+        html.P(f"Market source symbol: {provider_symbol}"),
         html.P(f"Latest bar: {latest_ts} UTC ({max(age_minutes, 0.0):.1f} minutes old)"),
+        html.P(
+            f"Freshness mode: {'strict (market open)' if market_open else 'relaxed (market closed)'}"
+        ),
         html.P(f"Date range: {df['Date'].min().date()} to {df['Date'].max().date()}"),
         html.P(f"Number of records: {len(df)}")
     ]), df_with_indicators.to_json(date_format='iso', orient='split')
@@ -872,10 +1033,11 @@ def train_models(n_clicks, data):
     [Input("predict-btn", "n_clicks")],
     [State("stock-data-store", "data"),
      State("rf-model-store", "data"),
-     State("lstm-model-store", "data")],
+     State("lstm-model-store", "data"),
+     State("stock-dropdown", "value")],
     prevent_initial_call=True
 )
-def make_predictions(n_clicks, data, rf_model_info, lstm_model_info):
+def make_predictions(n_clicks, data, rf_model_info, lstm_model_info, selected_symbol):
     if n_clicks is None or data is None:
         empty_fig = go.Figure().update_layout(title="No predictions available")
         return html.Div(), html.Div(), empty_fig, empty_fig, None, None, False, "", False, "", "", ""
@@ -883,7 +1045,7 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info):
     df = pd.read_json(data, orient='split')
     
     # Get sentiment features for the stock
-    ticker = df.get('Ticker', ['GOOGL']).iloc[0] if 'Ticker' in df.columns else 'GOOGL'
+    ticker = selected_symbol or (df.get('Ticker', ['GOOGL']).iloc[0] if 'Ticker' in df.columns else 'GOOGL')
     try:
         sentiment_analyzer = NewsSentimentAnalyzer()
         sentiment_features = sentiment_analyzer.get_sentiment_features(ticker, days=30)

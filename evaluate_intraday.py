@@ -17,39 +17,41 @@ def _directional_accuracy(y_true, y_pred, base_price):
 
 def evaluate_rf_intraday(df, horizon_steps=30, test_size=0.2, random_state=42):
     d = df.copy().dropna(subset=["Close"]).reset_index(drop=True)
-
-    split = int(len(d) * (1.0 - test_size))
-    train_df = d.iloc[:split].copy()
-    test_df = d.iloc[split:].copy()
-
     model = EnhancedRandomForestModel(
-        feature_selection_threshold=0.0,
+        feature_selection_threshold=0.01,
         random_state=random_state,
         horizon_steps=horizon_steps,
     )
+
+    full_feat = model.create_features(d)
+    split_feat = int(len(full_feat) * (1.0 - test_size))
+    split_feat = min(max(split_feat, 1), len(full_feat) - 1)
+    split_date = full_feat["Date"].iloc[split_feat]
+    train_df = d[d["Date"] <= split_date].copy().reset_index(drop=True)
+
     train_metrics = model.train(train_df, cv=3)
 
-    feats_test = model.create_features(test_df)
-    X_test = feats_test.drop(columns=["Date", "Close", "Next_Day_Close"], errors="ignore")
+    # Build features on full timeline and evaluate on aligned tail split.
+    full_feat = model.create_features(d)
+    eval_df = full_feat.iloc[split_feat:].copy().reset_index(drop=True)
+    if eval_df.empty:
+        raise ValueError("No RF evaluation samples available after feature alignment.")
 
-    # Align test columns to training feature order
-    X_test = X_test.reindex(columns=model.feature_columns, fill_value=0)
-    if model.selected_features is not None:
-        X_test = X_test[model.selected_feature_names]
-
-    y_true = feats_test["Next_Day_Close"].values
-    y_pred = model.pipeline.predict(X_test.values)
+    X_test = eval_df.drop(columns=["Date", "Close", "Next_Day_Close"], errors="ignore")
+    y_true = eval_df["Next_Day_Close"].values
+    y_pred = model.predict_from_features(X_test, eval_df["Close"].values, apply_direction=True)
 
     mae = float(mean_absolute_error(y_true, y_pred))
     rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
     r2 = float(r2_score(y_true, y_pred))
-    mape = float(np.mean(np.abs((y_true - y_pred) / y_true)) * 100.0)
-    dir_acc = _directional_accuracy(y_true, y_pred, base_price=feats_test["Close"].values)
+    denom = np.maximum(np.abs(y_true), 1e-8)
+    mape = float(np.mean(np.abs((y_true - y_pred) / denom)) * 100.0)
+    dir_acc = _directional_accuracy(y_true, y_pred, base_price=eval_df["Close"].values)
 
     return {
         "rows": int(len(d)),
         "train_rows": int(len(train_df)),
-        "test_rows": int(len(test_df)),
+        "test_rows": int(len(eval_df)),
         "mae": mae,
         "rmse": rmse,
         "r2": r2,
@@ -60,13 +62,7 @@ def evaluate_rf_intraday(df, horizon_steps=30, test_size=0.2, random_state=42):
 
 
 def evaluate_lstm_intraday(df, horizon_steps=120, test_size=0.2, epochs=3, batch_size=64, time_steps=60):
-    d = df.copy()
-    d["Target"] = d["Close"].shift(-horizon_steps)
-    d = d.dropna().reset_index(drop=True)
-
-    split = int(len(d) * (1.0 - test_size))
-    train_df = d.iloc[:split].copy()
-    test_df = d.iloc[split:].copy()
+    d = df.copy().dropna(subset=["Close"]).reset_index(drop=True)
 
     features = [
         'Close', 'Open', 'High', 'Low', 'Volume',
@@ -89,37 +85,48 @@ def evaluate_lstm_intraday(df, horizon_steps=120, test_size=0.2, epochs=3, batch
         horizon_steps=horizon_steps,
     )
 
+    full_feat = model.create_features(d)
+    split_feat = int(len(full_feat) * (1.0 - test_size))
+    split_feat = min(max(split_feat, 1), len(full_feat) - 1)
+    split_date = full_feat["Date"].iloc[split_feat]
+    train_df = d[d["Date"] <= split_date].copy().reset_index(drop=True)
+
     model.train(train_df)
 
-    df_test_feat = model.create_features(test_df)
-    eval_df = df_test_feat.copy()
-    eval_df['Target_Close'] = eval_df['Close'].shift(-horizon_steps)
+    # Build aligned feature/target dataset and split after alignment.
+    full_feat = model.create_features(d)
+    eval_columns = list(dict.fromkeys(model.features + ['Close']))
+    eval_df = full_feat[eval_columns].copy()
+    eval_df['Target_Close'] = full_feat['Close'].shift(-horizon_steps)
     eval_df = eval_df.dropna().reset_index(drop=True)
+    split_eval = min(max(split_feat, 1), len(eval_df) - 1)
+    eval_df = eval_df.iloc[split_eval:].copy().reset_index(drop=True)
+
+    if eval_df.empty:
+        raise ValueError("No evaluation samples available for LSTM after feature/target alignment.")
 
     X_test = eval_df[model.features].values
     y_test_inv = eval_df['Target_Close'].values
     base_prices = eval_df['Close'].values
 
-    y_pred_inv = model.tabular_model.predict(X_test)
-
-    if model.direction_model is not None:
-        dir_up = model.direction_model.predict(X_test)
-        y_pred_inv = np.where((dir_up == 1) & (y_pred_inv < base_prices), base_prices + np.abs(y_pred_inv - base_prices), y_pred_inv)
-        y_pred_inv = np.where((dir_up == 0) & (y_pred_inv > base_prices), base_prices - np.abs(y_pred_inv - base_prices), y_pred_inv)
+    y_pred_inv = model.predict_tabular_batch(eval_df)
 
     mse = float(mean_squared_error(y_test_inv, y_pred_inv))
     rmse = float(np.sqrt(mse))
     mae = float(mean_absolute_error(y_test_inv, y_pred_inv))
-    mape = float(np.mean(np.abs((y_test_inv - y_pred_inv) / y_test_inv)) * 100.0)
+    denom = np.maximum(np.abs(y_test_inv), 1e-8)
+    mape = float(np.mean(np.abs((y_test_inv - y_pred_inv) / denom)) * 100.0)
+    r2 = float(r2_score(y_test_inv, y_pred_inv))
     dir_acc = _directional_accuracy(y_test_inv, y_pred_inv, base_prices)
 
     out = {
         "rows": int(len(d)),
         "train_rows": int(len(train_df)),
-        "test_rows": int(len(test_df)),
+        "test_rows": int(len(eval_df)),
         "mse": mse,
         "rmse": rmse,
         "mae": mae,
+        "r2": r2,
         "mape": mape,
         "directional_accuracy": dir_acc,
     }
@@ -172,8 +179,8 @@ def main():
         time_steps=args.lstm_time_steps,
     )
     print("LSTM_2HR" if args.lstm_horizon == 120 else f"LSTM_{args.lstm_horizon}")
-    for k, v in lstm_metrics.items():
-        print(f"{k}: {v}")
+    for k in ["rows", "train_rows", "test_rows", "mae", "rmse", "r2", "mape", "directional_accuracy"]:
+        print(f"{k}: {lstm_metrics[k]}")
 
 
 if __name__ == "__main__":

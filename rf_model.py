@@ -30,6 +30,9 @@ class EnhancedRandomForestModel:
         self.directional_bias = 0.0
         self.direction_model = None
         self.direction_threshold = 0.5
+        self.price_blend_weight = 1.0
+        self.use_direction_adjustment = True
+        self.holdout_r2_ = 0.0
 
     def create_features(self, df):
         """
@@ -290,6 +293,46 @@ class EnhancedRandomForestModel:
         
         return selected_indices.tolist()
 
+    def _align_feature_frame(self, feature_frame):
+        """Align incoming feature frame to training-time column order and selection."""
+        aligned = feature_frame.reindex(columns=self.feature_columns, fill_value=0)
+        if hasattr(self, 'selected_features') and self.selected_features is not None:
+            aligned = aligned[self.selected_feature_names]
+        return aligned
+
+    def _apply_prediction_calibration(self, X, y_pred, base_prices, apply_direction=True):
+        """Apply holdout-calibrated blending and optional direction consistency."""
+        pred = np.asarray(y_pred, dtype=float)
+        base = np.asarray(base_prices, dtype=float)
+
+        blend = float(np.clip(getattr(self, "price_blend_weight", 1.0), 0.0, 1.0))
+        pred = blend * pred + (1.0 - blend) * base
+        pred = pred * (1.0 + float(getattr(self, "directional_bias", 0.0)))
+
+        if (
+            apply_direction
+            and getattr(self, "use_direction_adjustment", True)
+            and self.direction_model is not None
+            and len(pred) > 0
+        ):
+            if hasattr(self.direction_model, "predict_proba"):
+                dir_up = (
+                    self.direction_model.predict_proba(X)[:, 1] >= float(getattr(self, "direction_threshold", 0.5))
+                ).astype(int)
+            else:
+                dir_up = self.direction_model.predict(X).astype(int)
+
+            pred = np.where((dir_up == 1) & (pred < base), base + np.abs(pred - base), pred)
+            pred = np.where((dir_up == 0) & (pred > base), base - np.abs(pred - base), pred)
+        return pred
+
+    def predict_from_features(self, feature_frame, base_prices, apply_direction=True):
+        """Predict from a feature frame already engineered via create_features."""
+        X_df = self._align_feature_frame(feature_frame)
+        X = X_df.values
+        raw_pred = self.pipeline.predict(X)
+        return self._apply_prediction_calibration(X, raw_pred, base_prices, apply_direction=apply_direction)
+
     def predict_future(self, df, window_size=200, sentiment_features=None):
         """Predict the future closing price at the configured horizon
         
@@ -334,30 +377,22 @@ class EnhancedRandomForestModel:
             for col in missing_columns:
                 last_row[col] = 0
 
-        # Reorder the columns to match the training order
-        last_row = last_row[feature_columns]
-
-        # If we have selected features, use only those
-        if hasattr(self, 'selected_features') and self.selected_features is not None:
-            last_row = last_row[self.selected_feature_names]
-
-        # Extract features in the correct format
+        # Reorder/align features and extract matrix
+        last_row = self._align_feature_frame(last_row)
         X = last_row.values
 
         if X.size == 0:
             raise ValueError("No valid features found for prediction")
 
-        pred = float(self.pipeline.predict(X)[0] * (1.0 + self.directional_bias))
-        if self.direction_model is not None:
-            if hasattr(self.direction_model, "predict_proba"):
-                dir_up = int(self.direction_model.predict_proba(X)[0, 1] >= self.direction_threshold)
-            else:
-                dir_up = int(self.direction_model.predict(X)[0])
-            last_close = float(df_engineered["Close"].iloc[-1])
-            if dir_up == 1 and pred < last_close:
-                pred = last_close + abs(pred - last_close)
-            elif dir_up == 0 and pred > last_close:
-                pred = last_close - abs(pred - last_close)
+        last_close = float(df_engineered["Close"].iloc[-1])
+        pred = float(
+            self._apply_prediction_calibration(
+                X,
+                self.pipeline.predict(X),
+                np.array([last_close]),
+                apply_direction=True,
+            )[0]
+        )
         return pred
 
     def predict_next_30min(self, df, window_size=200, sentiment_features=None):
@@ -470,6 +505,7 @@ class EnhancedRandomForestModel:
                 best_score = score
                 best_params = params
 
+        self.holdout_r2_ = float(best_score)
         print(f"Selected RF parameters with holdout R2={best_score:.4f}: {best_params}")
         return best_params
 
@@ -553,38 +589,68 @@ class EnhancedRandomForestModel:
         )
         self.direction_model.fit(X_selected, y_dir)
 
-        # Directional calibration: small bias term tuned on a holdout tail
+        # Holdout calibration on tail split.
         calib_start = int(len(y) * 0.8)
         self.direction_threshold = 0.5
+        self.price_blend_weight = 1.0
+        self.use_direction_adjustment = True
         if len(y) - calib_start > 20:
-            calib_pred = self.pipeline.predict(X_selected[calib_start:])
+            calib_X = X_selected[calib_start:]
+            calib_pred = self.pipeline.predict(calib_X)
             calib_true = y[calib_start:]
             calib_base = base_close[calib_start:]
-            best_bias = 0.0
-            best_dir = -1.0
-            for bias in np.linspace(-0.004, 0.004, 17):
-                adj = calib_pred * (1.0 + bias)
-                dir_acc = np.mean(np.sign(adj - calib_base) == np.sign(calib_true - calib_base))
-                if dir_acc > best_dir:
-                    best_dir = dir_acc
-                    best_bias = float(bias)
-            self.directional_bias = best_bias
-
-            dir_proba = self.direction_model.predict_proba(X_selected[calib_start:])[:, 1]
-            calib_true_dir = (calib_true > calib_base).astype(int)
-            best_thr, best_acc = 0.5, -1.0
-            for thr in np.linspace(0.45, 0.60, 16):
-                pred_dir = (dir_proba >= thr).astype(int)
-                acc = np.mean(pred_dir == calib_true_dir)
-                if acc > best_acc:
-                    best_acc = acc
-                    best_thr = float(thr)
-            self.direction_threshold = best_thr
-        else:
             self.directional_bias = 0.0
 
+            # Blend with persistence baseline to stabilize horizon regression.
+            if self.holdout_r2_ < 0:
+                # In unstable holdout regimes, a partial persistence anchor is more robust.
+                self.price_blend_weight = 0.3
+                best_rmse = np.sqrt(mean_squared_error(
+                    calib_true,
+                    (self.price_blend_weight * calib_pred) + ((1.0 - self.price_blend_weight) * calib_base),
+                ))
+            else:
+                best_blend = 1.0
+                best_rmse = np.inf
+                best_obj = np.inf
+                for blend in np.linspace(0.0, 1.0, 21):
+                    blended = blend * calib_pred + (1.0 - blend) * calib_base
+                    rmse = np.sqrt(mean_squared_error(calib_true, blended))
+                    dir_acc = np.mean(np.sign(blended - calib_base) == np.sign(calib_true - calib_base))
+                    obj = rmse * (1.0 + 0.3 * (1.0 - dir_acc))
+                    if obj < best_obj:
+                        best_obj = obj
+                        best_rmse = rmse
+                        best_blend = float(blend)
+                self.price_blend_weight = best_blend
+
+            blended_calib = self.price_blend_weight * calib_pred + (1.0 - self.price_blend_weight) * calib_base
+
+            if self.use_direction_adjustment:
+                dir_proba = self.direction_model.predict_proba(calib_X)[:, 1]
+                calib_true_dir = (calib_true > calib_base).astype(int)
+                best_thr, best_acc = 0.5, -1.0
+                for thr in np.linspace(0.45, 0.60, 16):
+                    pred_dir = (dir_proba >= thr).astype(int)
+                    acc = np.mean(pred_dir == calib_true_dir)
+                    if acc > best_acc:
+                        best_acc = acc
+                        best_thr = float(thr)
+                self.direction_threshold = best_thr
+
+                # Keep direction adjustment only if it does not meaningfully hurt RMSE.
+                dir_up = (dir_proba >= self.direction_threshold).astype(int)
+                adjusted = np.where((dir_up == 1) & (blended_calib < calib_base), calib_base + np.abs(blended_calib - calib_base), blended_calib)
+                adjusted = np.where((dir_up == 0) & (adjusted > calib_base), calib_base - np.abs(adjusted - calib_base), adjusted)
+                adjusted_rmse = np.sqrt(mean_squared_error(calib_true, adjusted))
+                self.use_direction_adjustment = adjusted_rmse <= (best_rmse * 1.01)
+        else:
+            self.directional_bias = 0.0
+            self.price_blend_weight = 1.0
+            self.use_direction_adjustment = True
+
         # In-sample diagnostics
-        y_pred = self.pipeline.predict(X_selected)
+        y_pred = self._apply_prediction_calibration(X_selected, self.pipeline.predict(X_selected), base_close, apply_direction=False)
         rmse = float(np.sqrt(mean_squared_error(y, y_pred)))
         mae = float(mean_absolute_error(y, y_pred))
         r2 = float(r2_score(y, y_pred))

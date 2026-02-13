@@ -4,7 +4,9 @@ import tensorflow as tf
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingRegressor
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, HistGradientBoostingRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.linear_model import Ridge
 from tensorflow.keras.models import Sequential, Model
 from tensorflow.keras.layers import Bidirectional, LSTM, Dense, Dropout, Input, Concatenate
 from tensorflow.keras.layers import Conv1D, MaxPooling1D, Flatten, GlobalAveragePooling1D, Attention
@@ -31,6 +33,12 @@ class LSTMModel:
         self.directional_alpha = 1.0
         self.direction_model = None
         self.tabular_model = None
+        self.rf_120_model = None
+        self.reconstruction_model = None
+        self.ensemble_weights = (0.6, 0.3, 0.1)  # hgb_delta, rf_delta, persistence
+        self.direction_threshold = 0.5
+        self.price_blend_weight = 1.0
+        self.use_direction_adjustment = True
 
     def create_features(self, df, for_training=True):
         df = df.copy()
@@ -44,7 +52,7 @@ class LSTMModel:
         df['Volume_Change'] = df['Volume'].pct_change()
         
         # Price dynamics
-        for lag in [1, 3, 5, 7, 14, 21, 30]:
+        for lag in [1, 3, 5, 7, 14, 21, 30, 60, 90, 120, 180, 240]:
             df[f'Return_Lag_{lag}'] = df['Return'].shift(lag)
             df[f'Log_Return_Lag_{lag}'] = df['Log_Return'].shift(lag)
             if lag <= 7:  # Only calculate for shorter lags
@@ -57,10 +65,12 @@ class LSTMModel:
         df['Volume_Trend'] = (df['Volume_MA7'] / df['Volume_MA30']).pct_change(5)
         
         # Moving averages and volatility
-        for window in [7, 14, 21, 50, 100, 200]:
+        for window in [7, 14, 21, 50, 100, 200, 390]:
             df[f'MA{window}'] = df['Close'].rolling(window).mean()
             if window <= 50:  # Only calculate for shorter windows
                 df[f'Volatility{window}'] = df['Return'].rolling(window).std()
+        for window in [60, 120, 240]:
+            df[f'Volatility{window}'] = df['Return'].rolling(window).std()
         
         # Price relative to moving averages
         df['Price_to_MA50'] = df['Close'] / df['MA50']
@@ -140,6 +150,8 @@ class LSTMModel:
         
         # Target (for intraday, horizon_steps=120 means +2 hours with 1-minute bars)
         df['Next_Month_Close'] = df['Close'].shift(-self.horizon_steps)
+        df['Target_Delta'] = df['Next_Month_Close'] - df['Close']
+        df['Target_Return'] = df['Target_Delta'] / df['Close'].replace(0, np.nan)
         
         # Drop rows with missing values
         if not for_training:
@@ -219,32 +231,62 @@ class LSTMModel:
         if missing_features:
             raise ValueError(f"Missing features in data: {missing_features}")
 
-        X_tab, y_tab, base_tab = self._build_tabular_dataset(df_features)
-        if len(y_tab) < 500:
+        X_tab, y_delta_tab, y_close_tab, base_tab = self._build_tabular_dataset(df_features)
+        if len(y_close_tab) < 500:
             raise ValueError("Insufficient samples for 2-hour training")
 
         split_tab = int(len(X_tab) * 0.85)
         X_train_tab, X_val_tab = X_tab[:split_tab], X_tab[split_tab:]
-        y_train_tab, y_val_tab = y_tab[:split_tab], y_tab[split_tab:]
+        y_train_delta, y_val_delta = y_delta_tab[:split_tab], y_delta_tab[split_tab:]
+        y_train_close, y_val_close = y_close_tab[:split_tab], y_close_tab[split_tab:]
         base_train_tab = base_tab[:split_tab]
         base_val_tab = base_tab[split_tab:]
 
+        # Learn robust ensemble weights on rolling splits before final fit.
+        self.ensemble_weights = self._fit_rolling_ensemble_weights(X_train_tab, y_train_delta, base_train_tab)
+
+        # Main delta models
         self.tabular_model = HistGradientBoostingRegressor(
             loss='squared_error',
             learning_rate=0.03,
-            max_iter=250,
+            max_iter=350,
             max_leaf_nodes=63,
             min_samples_leaf=20,
             l2_regularization=0.1,
             random_state=42,
         )
-        self.tabular_model.fit(X_train_tab, y_train_tab)
+        self.rf_120_model = RandomForestRegressor(
+            n_estimators=550,
+            max_depth=18,
+            min_samples_leaf=2,
+            random_state=42,
+            n_jobs=-1,
+        )
+        self.tabular_model.fit(X_train_tab, y_train_delta)
+        self.rf_120_model.fit(X_train_tab, y_train_delta)
 
         self.scaler = RobustScaler()
         self.scaler.fit(df_features[self.features].values)
 
-        val_pred = self.tabular_model.predict(X_val_tab)
-        y_dir_train = (y_train_tab > base_train_tab).astype(int)
+        val_delta_hgb = self.tabular_model.predict(X_val_tab)
+        val_delta_rf = self.rf_120_model.predict(X_val_tab)
+        val_delta_ens = self._blend_delta(val_delta_hgb, val_delta_rf)
+        val_pred = base_val_tab + val_delta_ens
+
+        # Separate reconstruction model: map base + component deltas -> calibrated close.
+        recon_X_train = np.column_stack([
+            base_train_tab,
+            self.tabular_model.predict(X_train_tab),
+            self.rf_120_model.predict(X_train_tab),
+        ])
+        recon_y_train = y_train_close
+        self.reconstruction_model = Ridge(alpha=1.0, random_state=42)
+        self.reconstruction_model.fit(recon_X_train, recon_y_train)
+
+        recon_X_val = np.column_stack([base_val_tab, val_delta_hgb, val_delta_rf])
+        val_pred = self.reconstruction_model.predict(recon_X_val)
+
+        y_dir_train = (y_train_delta > 0).astype(int)
         self.direction_model = RandomForestClassifier(
             n_estimators=500,
             max_depth=10,
@@ -254,36 +296,196 @@ class LSTMModel:
         )
         self.direction_model.fit(X_train_tab, y_dir_train)
 
-        val_dir_pred = self.direction_model.predict(X_val_tab)
-        dir_acc = float(np.mean(val_dir_pred == (y_val_tab > base_val_tab).astype(int)))
-        mae = float(np.mean(np.abs(val_pred - y_val_tab)))
+        # Holdout calibration: blend with persistence baseline.
+        self.price_blend_weight = 1.0
+        best_blend = 1.0
+        best_rmse = np.inf
+        best_obj = np.inf
+        for blend in np.linspace(0.7, 1.0, 13):
+            blended = blend * val_pred + (1.0 - blend) * base_val_tab
+            rmse = np.sqrt(mean_squared_error(y_val_close, blended))
+            dir_acc = np.mean(np.sign(blended - base_val_tab) == np.sign(y_val_close - base_val_tab))
+            obj = rmse * (1.0 + 0.3 * (1.0 - dir_acc))
+            if obj < best_obj:
+                best_obj = obj
+                best_rmse = rmse
+                best_blend = float(blend)
+        self.price_blend_weight = best_blend
+        val_pred = self.price_blend_weight * val_pred + (1.0 - self.price_blend_weight) * base_val_tab
+
+        # Direction threshold calibration with RMSE safety check.
+        self.direction_threshold = 0.5
+        self.use_direction_adjustment = False
+        base_dir_acc = np.mean(np.sign(val_pred - base_val_tab) == np.sign(y_val_close - base_val_tab))
+        if hasattr(self.direction_model, "predict_proba"):
+            dir_proba = self.direction_model.predict_proba(X_val_tab)[:, 1]
+            true_dir = (y_val_delta > 0).astype(int)
+            best_thr, best_acc = 0.5, -1.0
+            for thr in np.linspace(0.40, 0.65, 26):
+                pred_dir = (dir_proba >= thr).astype(int)
+                acc = np.mean(pred_dir == true_dir)
+                if acc > best_acc:
+                    best_acc = acc
+                    best_thr = float(thr)
+            self.direction_threshold = best_thr
+
+            dir_up = (dir_proba >= self.direction_threshold).astype(int)
+            adjusted = np.where((dir_up == 1) & (val_pred < base_val_tab), base_val_tab + np.abs(val_pred - base_val_tab), val_pred)
+            adjusted = np.where((dir_up == 0) & (adjusted > base_val_tab), base_val_tab - np.abs(adjusted - base_val_tab), adjusted)
+            adjusted_rmse = np.sqrt(mean_squared_error(y_val_close, adjusted))
+            adjusted_dir_acc = np.mean(np.sign(adjusted - base_val_tab) == np.sign(y_val_close - base_val_tab))
+            self.use_direction_adjustment = (adjusted_rmse <= (best_rmse * 0.995)) and (adjusted_dir_acc >= (base_dir_acc + 0.01))
+            if self.use_direction_adjustment:
+                val_pred = adjusted
+
+        dir_acc = float(np.mean(np.sign(val_pred - base_val_tab) == np.sign(y_val_close - base_val_tab)))
+        mae = float(mean_absolute_error(y_val_close, val_pred))
+        rmse = float(np.sqrt(mean_squared_error(y_val_close, val_pred)))
+        r2 = float(r2_score(y_val_close, val_pred))
         return {
-            'model': 'tabular_hgbr',
+            'model': 'delta_hgb_rf120_ensemble',
             'val_mae': mae,
+            'val_rmse': rmse,
+            'val_r2': r2,
             'val_directional_accuracy': dir_acc,
+            'price_blend_weight': self.price_blend_weight,
+            'direction_threshold': self.direction_threshold,
+            'direction_adjustment_enabled': self.use_direction_adjustment,
+            'ensemble_weights': {
+                'lstm_tabular_delta': self.ensemble_weights[0],
+                'rf120_delta': self.ensemble_weights[1],
+                'persistence': self.ensemble_weights[2],
+            },
         }
 
     def _build_tabular_dataset(self, df_features):
         feature_df = df_features[self.features].copy()
         feature_df['Target_Close'] = df_features['Close'].shift(-self.horizon_steps)
+        feature_df['Target_Delta'] = feature_df['Target_Close'] - df_features['Close']
         feature_df['Base_Close'] = df_features['Close']
         feature_df = feature_df.dropna().reset_index(drop=True)
         X = feature_df[self.features].values
-        y = feature_df['Target_Close'].values
+        y_delta = feature_df['Target_Delta'].values
+        y_close = feature_df['Target_Close'].values
         base = feature_df['Base_Close'].values
-        return X, y, base
+        return X, y_delta, y_close, base
+
+    def _fit_rolling_ensemble_weights(self, X_train, y_delta_train, base_train):
+        """
+        Learn ensemble weights on rolling validation folds:
+        2-hour HGB delta model + RF120 delta model + persistence.
+        """
+        if len(X_train) < 400:
+            return (0.6, 0.3, 0.1)
+
+        splitter = TimeSeriesSplit(n_splits=4)
+        fold_hgb = []
+        fold_rf = []
+        fold_base = []
+        fold_y = []
+
+        for tr_idx, va_idx in splitter.split(X_train):
+            X_tr, X_va = X_train[tr_idx], X_train[va_idx]
+            y_tr, y_va = y_delta_train[tr_idx], y_delta_train[va_idx]
+            base_va = base_train[va_idx]
+
+            hgb = HistGradientBoostingRegressor(
+                loss='squared_error',
+                learning_rate=0.03,
+                max_iter=200,
+                max_leaf_nodes=63,
+                min_samples_leaf=20,
+                l2_regularization=0.1,
+                random_state=42,
+            )
+            rf = RandomForestRegressor(
+                n_estimators=350,
+                max_depth=16,
+                min_samples_leaf=2,
+                random_state=42,
+                n_jobs=-1,
+            )
+            hgb.fit(X_tr, y_tr)
+            rf.fit(X_tr, y_tr)
+
+            fold_hgb.append(hgb.predict(X_va))
+            fold_rf.append(rf.predict(X_va))
+            fold_base.append(base_va)
+            fold_y.append(y_va + base_va)
+
+        pred_hgb = np.concatenate(fold_hgb)
+        pred_rf = np.concatenate(fold_rf)
+        base = np.concatenate(fold_base)
+        y_true = np.concatenate(fold_y)
+
+        best = (0.6, 0.3, 0.1)
+        best_obj = np.inf
+        for w_hgb in np.linspace(0.3, 0.9, 13):
+            for w_rf in np.linspace(0.1, 0.7, 13):
+                w_p = 1.0 - w_hgb - w_rf
+                if w_p < 0.0 or w_p > 0.25:
+                    continue
+                pred_delta = (w_hgb * pred_hgb) + (w_rf * pred_rf)
+                pred_close = base + pred_delta
+                rmse = np.sqrt(mean_squared_error(y_true, pred_close))
+                dir_acc = np.mean(np.sign(y_true - base) == np.sign(pred_close - base))
+                # Reward directional stability while minimizing RMSE.
+                obj = rmse * (1.0 + 0.35 * (1.0 - dir_acc))
+                if obj < best_obj:
+                    best_obj = obj
+                    best = (float(w_hgb), float(w_rf), float(max(0.0, w_p)))
+        return best
+
+    def _blend_delta(self, delta_hgb, delta_rf):
+        w_hgb, w_rf, _ = self.ensemble_weights
+        return (w_hgb * delta_hgb) + (w_rf * delta_rf)
 
     def _predict_with_tabular_model(self, df_features):
         row = df_features[self.features].iloc[-1:].values
-        pred = float(self.tabular_model.predict(row)[0])
         last_close = float(df_features['Close'].iloc[-1])
-        if self.direction_model is not None:
-            dir_up = int(self.direction_model.predict(row)[0])
+        pred_delta_hgb = float(self.tabular_model.predict(row)[0])
+        pred_delta_rf = float(self.rf_120_model.predict(row)[0]) if self.rf_120_model is not None else pred_delta_hgb
+        pred_delta = float(self._blend_delta(np.array([pred_delta_hgb]), np.array([pred_delta_rf]))[0])
+        pred = last_close + pred_delta
+        if self.reconstruction_model is not None:
+            recon_row = np.array([[last_close, pred_delta_hgb, pred_delta_rf]])
+            pred = float(self.reconstruction_model.predict(recon_row)[0])
+        blend = float(np.clip(getattr(self, "price_blend_weight", 1.0), 0.0, 1.0))
+        pred = blend * pred + (1.0 - blend) * last_close
+        if self.direction_model is not None and getattr(self, "use_direction_adjustment", True):
+            if hasattr(self.direction_model, "predict_proba"):
+                dir_up = int(self.direction_model.predict_proba(row)[0, 1] >= float(getattr(self, "direction_threshold", 0.5)))
+            else:
+                dir_up = int(self.direction_model.predict(row)[0])
             if dir_up == 1 and pred < last_close:
                 pred = last_close + abs(pred - last_close)
             elif dir_up == 0 and pred > last_close:
                 pred = last_close - abs(pred - last_close)
         return pred, last_close
+
+    def predict_tabular_batch(self, df_features):
+        """Vectorized tabular predictions with holdout calibration."""
+        X = df_features[self.features].values
+        base = df_features['Close'].values.astype(float)
+        pred_delta_hgb = self.tabular_model.predict(X).astype(float)
+        pred_delta_rf = self.rf_120_model.predict(X).astype(float) if self.rf_120_model is not None else pred_delta_hgb
+        pred_delta = self._blend_delta(pred_delta_hgb, pred_delta_rf)
+        pred = base + pred_delta
+        if self.reconstruction_model is not None:
+            recon_X = np.column_stack([base, pred_delta_hgb, pred_delta_rf])
+            pred = self.reconstruction_model.predict(recon_X).astype(float)
+        blend = float(np.clip(getattr(self, "price_blend_weight", 1.0), 0.0, 1.0))
+        pred = blend * pred + (1.0 - blend) * base
+
+        if self.direction_model is not None and getattr(self, "use_direction_adjustment", True):
+            if hasattr(self.direction_model, "predict_proba"):
+                dir_up = (self.direction_model.predict_proba(X)[:, 1] >= float(getattr(self, "direction_threshold", 0.5))).astype(int)
+            else:
+                dir_up = self.direction_model.predict(X).astype(int)
+            pred = np.where((dir_up == 1) & (pred < base), base + np.abs(pred - base), pred)
+            pred = np.where((dir_up == 0) & (pred > base), base - np.abs(pred - base), pred)
+
+        return pred
 
     def add_sentiment_features(self, df, sentiment_features):
         """
@@ -365,7 +567,7 @@ class LSTMModel:
                     'predicted_price': predicted_price,
                     'confidence_interval': (predicted_price - 1.96 * uncertainty, predicted_price + 1.96 * uncertainty),
                     'uncertainty': uncertainty,
-                    'method': 'tabular_hgbr_2h'
+                    'method': 'delta_ensemble_2h'
                 }
 
             # Fallback to legacy LSTM path
@@ -614,43 +816,75 @@ class LSTMModel:
         Returns:
             dict: Dictionary with evaluation metrics
         """
+        # Preferred path: tabular horizon model used in app inference.
+        if self.tabular_model is not None:
+            df_feat = self.create_features(test_df, for_training=False)
+            eval_df = df_feat.copy()
+            eval_df['Target_Close'] = eval_df['Close'].shift(-self.horizon_steps)
+            eval_df = eval_df.dropna().reset_index(drop=True)
+            if eval_df.empty:
+                raise ValueError("No evaluation samples available after feature/target alignment.")
+
+            y_true = eval_df['Target_Close'].values.astype(float)
+            y_pred = self.predict_tabular_batch(eval_df)
+            base = eval_df['Close'].values.astype(float)
+
+            mse = float(mean_squared_error(y_true, y_pred))
+            rmse = float(np.sqrt(mse))
+            mae = float(mean_absolute_error(y_true, y_pred))
+            denom = np.maximum(np.abs(y_true), 1e-8)
+            mape = float(np.mean(np.abs((y_true - y_pred) / denom)) * 100.0)
+            r2 = float(r2_score(y_true, y_pred))
+            directional_accuracy = float(np.mean(np.sign(y_true - base) == np.sign(y_pred - base)) * 100.0)
+            return {
+                'mse': mse,
+                'rmse': rmse,
+                'mae': mae,
+                'mape': mape,
+                'r2': r2,
+                'directional_accuracy': directional_accuracy
+            }
+
         if not self.model:
             raise ValueError("Model not trained")
-            
+
         df_features = self.create_features(test_df)
-        
+
         # Prepare test data
         test_data = self.scaler.transform(df_features[self.features].values)
         X_test, y_test = self.create_sequences(test_data)
-        
+
         # Make predictions
         y_pred = self.model.predict(X_test)
-        
+
         # Inverse transform predictions and actual values
         dummy = np.zeros((len(y_pred), len(self.features)))
         dummy[:, self.target_index] = y_pred.flatten()
         y_pred_inv = self.scaler.inverse_transform(dummy)[:, self.target_index]
-        
+
         dummy = np.zeros((len(y_test), len(self.features)))
         dummy[:, self.target_index] = y_test
         y_test_inv = self.scaler.inverse_transform(dummy)[:, self.target_index]
-        
+
         # Calculate metrics
-        mse = np.mean((y_pred_inv - y_test_inv) ** 2)
-        rmse = np.sqrt(mse)
-        mae = np.mean(np.abs(y_pred_inv - y_test_inv))
-        mape = np.mean(np.abs((y_test_inv - y_pred_inv) / y_test_inv)) * 100
-        
+        mse = float(np.mean((y_pred_inv - y_test_inv) ** 2))
+        rmse = float(np.sqrt(mse))
+        mae = float(np.mean(np.abs(y_pred_inv - y_test_inv)))
+        denom = np.maximum(np.abs(y_test_inv), 1e-8)
+        mape = float(np.mean(np.abs((y_test_inv - y_pred_inv) / denom)) * 100.0)
+        r2 = float(r2_score(y_test_inv, y_pred_inv))
+
         # Calculate directional accuracy (up/down prediction)
         direction_actual = np.sign(y_test_inv[1:] - y_test_inv[:-1])
         direction_pred = np.sign(y_pred_inv[1:] - y_pred_inv[:-1])
-        directional_accuracy = np.mean(direction_actual == direction_pred) * 100
-        
+        directional_accuracy = float(np.mean(direction_actual == direction_pred) * 100.0)
+
         return {
             'mse': mse,
             'rmse': rmse,
             'mae': mae,
             'mape': mape,
+            'r2': r2,
             'directional_accuracy': directional_accuracy
         }
     
@@ -837,7 +1071,13 @@ class LSTMModel:
                     'target_index': self.target_index
                 },
                 'tabular_model': self.tabular_model,
+                'rf_120_model': self.rf_120_model,
+                'reconstruction_model': self.reconstruction_model,
                 'direction_model': self.direction_model,
+                'ensemble_weights': self.ensemble_weights,
+                'direction_threshold': self.direction_threshold,
+                'price_blend_weight': self.price_blend_weight,
+                'use_direction_adjustment': self.use_direction_adjustment,
             }
             joblib.dump(metadata, keras_path + '_meta.pkl')
             print(f"Model metadata saved to {keras_path}_meta.pkl")
@@ -944,7 +1184,13 @@ class LSTMModel:
                 model.horizon_steps = config.get('horizon_steps', model.horizon_steps)
                 model.target_index = config.get('target_index', model.target_index)
                 model.tabular_model = metadata.get('tabular_model')
+                model.rf_120_model = metadata.get('rf_120_model')
+                model.reconstruction_model = metadata.get('reconstruction_model')
                 model.direction_model = metadata.get('direction_model')
+                model.ensemble_weights = metadata.get('ensemble_weights', model.ensemble_weights)
+                model.direction_threshold = metadata.get('direction_threshold', model.direction_threshold)
+                model.price_blend_weight = metadata.get('price_blend_weight', model.price_blend_weight)
+                model.use_direction_adjustment = metadata.get('use_direction_adjustment', model.use_direction_adjustment)
                 print(f"Metadata loaded from {meta_path}")
             else:
                 print(f"Warning: Metadata file {meta_path} not found.")
