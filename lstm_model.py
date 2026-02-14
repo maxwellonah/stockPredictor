@@ -19,7 +19,7 @@ import os
 import math
 
 class LSTMModel:
-    def __init__(self, time_steps=60, features=None, epochs=100, batch_size=64, horizon_steps=120):
+    def __init__(self, time_steps=60, features=None, epochs=100, batch_size=64, horizon_steps=10):
         self.time_steps = time_steps
         self.features = features or ['Close']
         self.epochs = epochs
@@ -148,7 +148,7 @@ class LSTMModel:
         if 'Sentiment_Volatility' not in df.columns:
             df['Sentiment_Volatility'] = 0
         
-        # Target (for intraday, horizon_steps=120 means +2 hours with 1-minute bars)
+        # Target for the configured intraday horizon (1-minute bars).
         df['Next_Month_Close'] = df['Close'].shift(-self.horizon_steps)
         df['Target_Delta'] = df['Next_Month_Close'] - df['Close']
         df['Target_Return'] = df['Target_Delta'] / df['Close'].replace(0, np.nan)
@@ -233,7 +233,7 @@ class LSTMModel:
 
         X_tab, y_delta_tab, y_close_tab, base_tab = self._build_tabular_dataset(df_features)
         if len(y_close_tab) < 500:
-            raise ValueError("Insufficient samples for 2-hour training")
+            raise ValueError(f"Insufficient samples for {self.horizon_steps}-minute training")
 
         split_tab = int(len(X_tab) * 0.85)
         X_train_tab, X_val_tab = X_tab[:split_tab], X_tab[split_tab:]
@@ -373,7 +373,7 @@ class LSTMModel:
     def _fit_rolling_ensemble_weights(self, X_train, y_delta_train, base_train):
         """
         Learn ensemble weights on rolling validation folds:
-        2-hour HGB delta model + RF120 delta model + persistence.
+        HGB delta model + RF delta model + persistence for the configured horizon.
         """
         if len(X_train) < 400:
             return (0.6, 0.3, 0.1)
@@ -440,9 +440,31 @@ class LSTMModel:
         w_hgb, w_rf, _ = self.ensemble_weights
         return (w_hgb * delta_hgb) + (w_rf * delta_rf)
 
+    def _sanitize_feature_frame(self, feature_frame):
+        safe = feature_frame.copy()
+        safe = safe.apply(pd.to_numeric, errors='coerce')
+        safe = safe.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0.0)
+        return safe
+
+    def _volatility_cap_pct(self, df_features):
+        for col in ['Volatility120', 'Volatility60', 'Volatility21', 'Volatility14']:
+            if col in df_features.columns:
+                series = pd.to_numeric(df_features[col], errors='coerce')
+                if series.notna().any():
+                    vol = float(series.dropna().iloc[-1])
+                    horizon_vol = max(vol, 0.0) * np.sqrt(max(self.horizon_steps, 1))
+                    return float(np.clip(4.0 * horizon_vol * 100.0, 0.5, 12.0))
+        return 6.0
+
     def _predict_with_tabular_model(self, df_features):
-        row = df_features[self.features].iloc[-1:].values
-        last_close = float(df_features['Close'].iloc[-1])
+        row_df = self._sanitize_feature_frame(df_features[self.features].iloc[-1:].copy())
+        row = row_df.values.astype(float)
+        close_series = pd.to_numeric(df_features['Close'], errors='coerce').dropna()
+        if close_series.empty:
+            raise ValueError(
+                f"Cannot predict {self.horizon_steps}-minute price: missing valid Close values."
+            )
+        last_close = float(close_series.iloc[-1])
         pred_delta_hgb = float(self.tabular_model.predict(row)[0])
         pred_delta_rf = float(self.rf_120_model.predict(row)[0]) if self.rf_120_model is not None else pred_delta_hgb
         pred_delta = float(self._blend_delta(np.array([pred_delta_hgb]), np.array([pred_delta_rf]))[0])
@@ -452,6 +474,10 @@ class LSTMModel:
             pred = float(self.reconstruction_model.predict(recon_row)[0])
         blend = float(np.clip(getattr(self, "price_blend_weight", 1.0), 0.0, 1.0))
         pred = blend * pred + (1.0 - blend) * last_close
+        cap_pct = self._volatility_cap_pct(df_features)
+        lower = last_close * (1.0 - cap_pct / 100.0)
+        upper = last_close * (1.0 + cap_pct / 100.0)
+        pred = float(np.clip(pred, lower, upper))
         if self.direction_model is not None and getattr(self, "use_direction_adjustment", True):
             if hasattr(self.direction_model, "predict_proba"):
                 dir_up = int(self.direction_model.predict_proba(row)[0, 1] >= float(getattr(self, "direction_threshold", 0.5)))
@@ -465,7 +491,8 @@ class LSTMModel:
 
     def predict_tabular_batch(self, df_features):
         """Vectorized tabular predictions with holdout calibration."""
-        X = df_features[self.features].values
+        X_df = self._sanitize_feature_frame(df_features[self.features].copy())
+        X = X_df.values.astype(float)
         base = df_features['Close'].values.astype(float)
         pred_delta_hgb = self.tabular_model.predict(X).astype(float)
         pred_delta_rf = self.rf_120_model.predict(X).astype(float) if self.rf_120_model is not None else pred_delta_hgb
@@ -476,6 +503,10 @@ class LSTMModel:
             pred = self.reconstruction_model.predict(recon_X).astype(float)
         blend = float(np.clip(getattr(self, "price_blend_weight", 1.0), 0.0, 1.0))
         pred = blend * pred + (1.0 - blend) * base
+        cap_pct = self._volatility_cap_pct(df_features)
+        lower = base * (1.0 - cap_pct / 100.0)
+        upper = base * (1.0 + cap_pct / 100.0)
+        pred = np.clip(pred, lower, upper)
 
         if self.direction_model is not None and getattr(self, "use_direction_adjustment", True):
             if hasattr(self.direction_model, "predict_proba"):
@@ -567,7 +598,7 @@ class LSTMModel:
                     'predicted_price': predicted_price,
                     'confidence_interval': (predicted_price - 1.96 * uncertainty, predicted_price + 1.96 * uncertainty),
                     'uncertainty': uncertainty,
-                    'method': 'delta_ensemble_2h'
+                    'method': f'delta_ensemble_{self.horizon_steps}m'
                 }
 
             # Fallback to legacy LSTM path

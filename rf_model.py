@@ -9,7 +9,7 @@ import joblib
 import os
 
 class EnhancedRandomForestModel:
-    def __init__(self, feature_selection_threshold=0.01, random_state=42, horizon_steps=30):
+    def __init__(self, feature_selection_threshold=0.01, random_state=42, horizon_steps=5):
         """
         Improved Random Forest model with feature selection and hyperparameter tuning
         
@@ -197,7 +197,7 @@ class EnhancedRandomForestModel:
         if 'Sentiment_Volatility' not in df.columns:
             df['Sentiment_Volatility'] = 0
         
-        # Target Variable (for intraday, horizon_steps=30 means +30 minutes with 1-minute bars)
+        # Target Variable (for intraday, horizon_steps=5 means +5 minutes with 1-minute bars)
         df['Next_Day_Close'] = df['Close'].shift(-self.horizon_steps)
         
         # Fill initial NaN values with reasonable defaults
@@ -298,6 +298,8 @@ class EnhancedRandomForestModel:
         aligned = feature_frame.reindex(columns=self.feature_columns, fill_value=0)
         if hasattr(self, 'selected_features') and self.selected_features is not None:
             aligned = aligned[self.selected_feature_names]
+        aligned = aligned.apply(pd.to_numeric, errors='coerce')
+        aligned = aligned.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0.0)
         return aligned
 
     def _apply_prediction_calibration(self, X, y_pred, base_prices, apply_direction=True):
@@ -329,7 +331,7 @@ class EnhancedRandomForestModel:
     def predict_from_features(self, feature_frame, base_prices, apply_direction=True):
         """Predict from a feature frame already engineered via create_features."""
         X_df = self._align_feature_frame(feature_frame)
-        X = X_df.values
+        X = X_df.values.astype(float)
         raw_pred = self.pipeline.predict(X)
         return self._apply_prediction_calibration(X, raw_pred, base_prices, apply_direction=apply_direction)
 
@@ -395,8 +397,8 @@ class EnhancedRandomForestModel:
         )
         return pred
 
-    def predict_next_30min(self, df, window_size=200, sentiment_features=None):
-        """Convenience method: predict 30 minutes ahead (requires 1-minute bars)."""
+    def predict_next_5min(self, df, window_size=200, sentiment_features=None):
+        """Convenience method: predict 5 minutes ahead (requires 1-minute bars)."""
         return self.predict_future(df, window_size=window_size, sentiment_features=sentiment_features)
 
     def predict_next_day(self, df, window_size=200, sentiment_features=None):

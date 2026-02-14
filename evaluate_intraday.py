@@ -15,7 +15,7 @@ def _directional_accuracy(y_true, y_pred, base_price):
     return float((actual_dir == pred_dir).mean() * 100.0)
 
 
-def evaluate_rf_intraday(df, horizon_steps=30, test_size=0.2, random_state=42):
+def evaluate_rf_intraday(df, horizon_steps=5, test_size=0.2, random_state=42):
     d = df.copy().dropna(subset=["Close"]).reset_index(drop=True)
     model = EnhancedRandomForestModel(
         feature_selection_threshold=0.01,
@@ -61,7 +61,7 @@ def evaluate_rf_intraday(df, horizon_steps=30, test_size=0.2, random_state=42):
     }
 
 
-def evaluate_lstm_intraday(df, horizon_steps=120, test_size=0.2, epochs=3, batch_size=64, time_steps=60):
+def evaluate_lstm_intraday(df, horizon_steps=10, test_size=0.2, epochs=3, batch_size=64, time_steps=60):
     d = df.copy().dropna(subset=["Close"]).reset_index(drop=True)
 
     features = [
@@ -137,8 +137,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ticker", default="GOOGL")
     parser.add_argument("--days", type=int, default=30)
-    parser.add_argument("--rf_horizon", type=int, default=30)
-    parser.add_argument("--lstm_horizon", type=int, default=120)
+    parser.add_argument("--rf_horizon", type=int, default=5)
+    parser.add_argument("--lstm_horizon", type=int, default=10)
     parser.add_argument("--lstm_epochs", type=int, default=15)
     parser.add_argument("--lstm_time_steps", type=int, default=60)
     parser.add_argument("--csv", default=None, help="Optional local CSV path with Date,Open,High,Low,Close,Volume")
@@ -167,7 +167,7 @@ def main():
     df = df.sort_values("Date").reset_index(drop=True)
 
     rf_metrics = evaluate_rf_intraday(df, horizon_steps=args.rf_horizon)
-    print("RF_30MIN" if args.rf_horizon == 30 else f"RF_{args.rf_horizon}")
+    print("RF_5MIN" if args.rf_horizon == 5 else f"RF_{args.rf_horizon}")
     for k in ["rows", "train_rows", "test_rows", "mae", "rmse", "r2", "mape", "directional_accuracy"]:
         print(f"{k}: {rf_metrics[k]}")
     print(f"best_params: {rf_metrics.get('best_params', {})}")
@@ -178,7 +178,7 @@ def main():
         epochs=args.lstm_epochs,
         time_steps=args.lstm_time_steps,
     )
-    print("LSTM_2HR" if args.lstm_horizon == 120 else f"LSTM_{args.lstm_horizon}")
+    print("LSTM_10MIN" if args.lstm_horizon == 10 else f"LSTM_{args.lstm_horizon}")
     for k in ["rows", "train_rows", "test_rows", "mae", "rmse", "r2", "mape", "directional_accuracy"]:
         print(f"{k}: {lstm_metrics[k]}")
 

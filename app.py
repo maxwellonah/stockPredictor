@@ -1,4 +1,5 @@
 import os
+import json
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -23,6 +24,15 @@ FINNHUB_API_KEY = os.environ.get('FINNHUB_API_KEY', "d6747gpr01qmckkc2ig0d6747gp
 TWELVE_DATA_API_KEY = os.environ.get('TWELVE_DATA_API_KEY', "22425aaff0ea4df09f0e4f1fb9791b9f")
 MAX_FETCH_DATA_AGE_MINUTES = 10
 FETCH_LOOKBACK_DAYS = 7
+TRADE_ACCOUNT_SIZE_USD = float(os.environ.get("TRADE_ACCOUNT_SIZE_USD", "10000"))
+RISK_PER_TRADE = float(os.environ.get("RISK_PER_TRADE", "0.01"))
+MIN_RF_R2 = float(os.environ.get("MIN_RF_R2", "0.0"))
+MIN_RF_DA = float(os.environ.get("MIN_RF_DA", "55.0"))
+MIN_LSTM_DA = float(os.environ.get("MIN_LSTM_DA", "60.0"))
+RF_HORIZON_MINUTES = max(1, int(os.environ.get("RF_HORIZON_MINUTES", "5")))
+LSTM_HORIZON_MINUTES = max(1, int(os.environ.get("LSTM_HORIZON_MINUTES", "10")))
+RF_MODEL_LABEL = f"AI {RF_HORIZON_MINUTES}-Min Model"
+LSTM_MODEL_LABEL = f"AI {LSTM_HORIZON_MINUTES}-Min Model"
 
 # Initialize the Dash app with a Bootstrap theme
 app = Dash(__name__, external_stylesheets=[dbc.themes.FLATLY], suppress_callback_exceptions=True)
@@ -344,6 +354,15 @@ def _safe_mape(y_true, y_pred):
     return float(np.mean(np.abs((y_true - y_pred) / denom)) * 100.0)
 
 
+def _read_store_json(data):
+    """Read Dash store payloads safely across string/dict inputs."""
+    if isinstance(data, str):
+        return pd.read_json(io.StringIO(data), orient='split')
+    if isinstance(data, dict):
+        return pd.read_json(io.StringIO(json.dumps(data)), orient='split')
+    return pd.read_json(data, orient='split')
+
+
 def evaluate_rf_holdout(model, df, test_size=0.2):
     d = df.copy().dropna(subset=["Close"]).sort_values("Date").reset_index(drop=True)
     full_feat = model.create_features(d)
@@ -394,6 +413,192 @@ def evaluate_lstm_holdout(model, df, test_size=0.2):
         "directional_accuracy": _directional_accuracy(y_true, y_pred, base),
     }
 
+
+def build_trade_decision(rf_model_info, lstm_model_info, last_price, rf_pred_price, lstm_pred_price):
+    """Scored rule engine with graded actions to reduce dead-end NO-TRADE outcomes."""
+    rf_holdout = (rf_model_info or {}).get("metrics", {}).get("holdout", {}) if rf_model_info else {}
+    lstm_holdout = (
+        (lstm_model_info or {}).get("metrics", {}) or (lstm_model_info or {}).get("history", {})
+    ).get("holdout", {}) if lstm_model_info else {}
+
+    rf_r2 = float(rf_holdout.get("r2", -999.0))
+    rf_da = float(rf_holdout.get("directional_accuracy", 0.0))
+    lstm_da = float(lstm_holdout.get("directional_accuracy", 0.0))
+    rf_rmse = float(rf_holdout.get("rmse", 0.0))
+    lstm_rmse = float(lstm_holdout.get("rmse", 0.0))
+
+    rf_change_pct = ((rf_pred_price - last_price) / max(last_price, 1e-8)) * 100.0
+    lstm_change_pct = ((lstm_pred_price - last_price) / max(last_price, 1e-8)) * 100.0
+
+    rf_dir = int(np.sign(rf_change_pct))
+    lstm_dir = int(np.sign(lstm_change_pct))
+    direction = "LONG" if lstm_dir > 0 else ("SHORT" if lstm_dir < 0 else "FLAT")
+
+    noise_pct = max(
+        (rf_rmse / max(last_price, 1e-8)) * 100.0,
+        (lstm_rmse / max(last_price, 1e-8)) * 100.0,
+        0.10,
+    )
+    min_move_pct = max(0.35 * noise_pct, 0.12)
+
+    # Soft scoring instead of hard binary gating.
+    rf_r2_score = float(np.clip((rf_r2 - (MIN_RF_R2 - 0.35)) / 0.55, 0.0, 1.0))
+    rf_da_score = float(np.clip((rf_da - (MIN_RF_DA - 10.0)) / 20.0, 0.0, 1.0))
+    lstm_da_score = float(np.clip((lstm_da - (MIN_LSTM_DA - 10.0)) / 20.0, 0.0, 1.0))
+    quality_score = 0.35 * rf_r2_score + 0.35 * rf_da_score + 0.30 * lstm_da_score
+
+    if rf_dir != 0 and rf_dir == lstm_dir:
+        consensus_score = 1.0
+    elif rf_dir == 0 or lstm_dir == 0:
+        consensus_score = 0.45
+    else:
+        consensus_score = 0.10
+
+    move_strength = abs(lstm_change_pct) / max(min_move_pct, 1e-8)
+    move_score = float(np.clip(move_strength, 0.0, 1.0))
+    confidence_score = float(0.45 * quality_score + 0.30 * consensus_score + 0.25 * move_score)
+
+    if direction == "FLAT":
+        signal = "NO TRADE"
+        setup_grade = "D"
+        size_mult = 0.0
+    elif confidence_score >= 0.72:
+        signal = "TRADE"
+        setup_grade = "A"
+        size_mult = 1.0
+    elif confidence_score >= 0.58:
+        signal = "TRADE"
+        setup_grade = "B"
+        size_mult = 0.6
+    elif confidence_score >= 0.45:
+        signal = "WATCHLIST"
+        setup_grade = "C"
+        size_mult = 0.0
+    else:
+        signal = "NO TRADE"
+        setup_grade = "D"
+        size_mult = 0.0
+
+    if setup_grade == "A":
+        stop_pct = max(0.80 * noise_pct, 0.20)
+        target_pct = max(1.9 * stop_pct, 1.0 * abs(lstm_change_pct))
+    elif setup_grade == "B":
+        stop_pct = max(0.90 * noise_pct, 0.18)
+        target_pct = max(1.6 * stop_pct, 0.85 * abs(lstm_change_pct))
+    else:
+        stop_pct = max(noise_pct, 0.25)
+        target_pct = max(1.3 * stop_pct, 0.75 * abs(lstm_change_pct))
+
+    stop_distance = last_price * (stop_pct / 100.0)
+    target_distance = last_price * (target_pct / 100.0)
+
+    if direction == "LONG":
+        stop_price = last_price - stop_distance
+        target_price = last_price + target_distance
+    elif direction == "SHORT":
+        stop_price = last_price + stop_distance
+        target_price = last_price - target_distance
+    else:
+        stop_price = last_price
+        target_price = last_price
+
+    risk_amount = TRADE_ACCOUNT_SIZE_USD * RISK_PER_TRADE * size_mult
+    position_notional = risk_amount / max(stop_pct / 100.0, 1e-8)
+    max_position = TRADE_ACCOUNT_SIZE_USD * 0.35 * max(size_mult, 0.1)
+    position_notional = min(position_notional, max_position)
+    quantity = position_notional / max(last_price, 1e-8)
+
+    options = []
+    if signal == "TRADE":
+        options.append(
+            f"Primary: {direction} setup {setup_grade} with size multiplier {size_mult:.1f}, stop {stop_pct:.2f}%, target {target_pct:.2f}%."
+        )
+        options.append(
+            f"Alternative: Enter 50% now, add only if next {RF_HORIZON_MINUTES}-min prediction keeps same direction."
+        )
+    elif signal == "WATCHLIST":
+        options.append("Watchlist: wait for next refresh; enter only if horizons align and confidence rises above 0.58.")
+        options.append("Alternative: small probe (25%) only if price confirms direction with momentum.")
+    else:
+        options.append("Stand aside: edge is weak or conflicting.")
+        options.append("Alternative: monitor for alignment or larger move beyond noise floor.")
+
+    reasons = [
+        f"Confidence {confidence_score:.2f} (quality {quality_score:.2f}, consensus {consensus_score:.2f}, move {move_score:.2f})",
+        f"RF holdout: R2 {rf_r2:.3f}, DA {rf_da:.1f}% | {LSTM_HORIZON_MINUTES}-min DA {lstm_da:.1f}%",
+        f"Predicted moves: RF {rf_change_pct:+.2f}% | {LSTM_HORIZON_MINUTES}-min {lstm_change_pct:+.2f}% | min move {min_move_pct:.2f}%",
+    ]
+
+    return {
+        "signal": signal,
+        "setup_grade": setup_grade,
+        "confidence_score": confidence_score,
+        "direction": direction,
+        "entry_price": float(last_price),
+        "stop_price": float(stop_price),
+        "target_price": float(target_price),
+        "position_notional_usd": float(position_notional if size_mult > 0 else 0.0),
+        "quantity_units": float(quantity if size_mult > 0 else 0.0),
+        "size_multiplier": float(size_mult),
+        "stop_pct": float(stop_pct),
+        "target_pct": float(target_pct),
+        "rf_change_pct": float(rf_change_pct),
+        "lstm_change_pct": float(lstm_change_pct),
+        "noise_pct": float(noise_pct),
+        "reasons": reasons,
+        "options": options,
+    }
+
+
+def render_trade_decision_panel(decision):
+    signal = decision.get("signal", "NO TRADE")
+    is_trade = signal == "TRADE"
+    if signal == "TRADE":
+        badge_color = "success"
+    elif signal == "WATCHLIST":
+        badge_color = "warning"
+    else:
+        badge_color = "secondary"
+    direction_color = "success" if decision.get("direction") == "LONG" else ("danger" if decision.get("direction") == "SHORT" else "secondary")
+    reason_items = [html.Li(r) for r in decision.get("reasons", [])]
+    option_items = [html.Li(r) for r in decision.get("options", [])]
+
+    return dbc.Card(
+        [
+            dbc.CardHeader("Rule-Based Trade Decision"),
+            dbc.CardBody(
+                [
+                    html.H4(
+                        [
+                            dbc.Badge(signal, color=badge_color, className="me-2"),
+                            dbc.Badge(f"Setup {decision.get('setup_grade', 'D')}", color="dark", className="me-2"),
+                            dbc.Badge(decision.get("direction", "FLAT"), color=direction_color),
+                        ],
+                        className="mb-3",
+                    ),
+                    html.P(f"Confidence Score: {decision.get('confidence_score', 0.0):.2f}"),
+                    html.P(f"Entry: ${decision.get('entry_price', 0.0):.2f}"),
+                    html.P(f"Stop: ${decision.get('stop_price', 0.0):.2f} ({decision.get('stop_pct', 0.0):.2f}%)"),
+                    html.P(f"Target: ${decision.get('target_price', 0.0):.2f} ({decision.get('target_pct', 0.0):.2f}%)"),
+                    html.P(f"Size Multiplier: {decision.get('size_multiplier', 0.0):.2f}x"),
+                    html.P(f"Suggested Position Notional: ${decision.get('position_notional_usd', 0.0):,.2f}"),
+                    html.P(f"Approx Quantity: {decision.get('quantity_units', 0.0):,.4f} units"),
+                    html.Hr(),
+                    html.P(
+                        f"Model Moves: RF {decision.get('rf_change_pct', 0.0):+.2f}% | "
+                        f"{LSTM_HORIZON_MINUTES}-Min {decision.get('lstm_change_pct', 0.0):+.2f}% | "
+                        f"Noise Floor {decision.get('noise_pct', 0.0):.2f}%"
+                    ),
+                    html.H6("Rule Check"),
+                    html.Ul(reason_items),
+                    html.H6("Best Options"),
+                    html.Ul(option_items),
+                ]
+            ),
+        ],
+        className="mt-3",
+    )
+
 # Function to train RF model
 def train_rf_model(df, status_div_id):
     """Train Random Forest model and return metrics"""
@@ -403,7 +608,7 @@ def train_rf_model(df, status_div_id):
         rf_model = EnhancedRandomForestModel(
             feature_selection_threshold=0.01,
             random_state=42,
-            horizon_steps=30
+            horizon_steps=RF_HORIZON_MINUTES
         )
         
         # Train model
@@ -434,7 +639,7 @@ def train_lstm_model(df, status_div_id):
     """Train LSTM model and return metrics"""
     try:
         print("Starting LSTM model training...")
-        # Define a richer feature set for better 2-hour forecasting accuracy
+        # Define a richer feature set for short-horizon intraday forecasting.
         features = [
             'Close', 'Open', 'High', 'Low', 'Volume',
             'Return', 'Log_Return', 'Volume_Change',
@@ -465,11 +670,11 @@ def train_lstm_model(df, status_div_id):
             features=features,
             epochs=120,
             batch_size=32,
-            horizon_steps=120
+            horizon_steps=LSTM_HORIZON_MINUTES
         )
         
         # Train model
-        print("Training AI 2-Hour Model...")
+        print(f"Training {LSTM_MODEL_LABEL}...")
         history = lstm_model.train(df)
         history["holdout"] = evaluate_lstm_holdout(lstm_model, df, test_size=0.2)
         
@@ -542,7 +747,10 @@ app.layout = dbc.Container([
     dbc.Row([
         dbc.Col([
             html.H1("Hybrid Stock Prediction System", className="text-center my-4"),
-            html.P("Using AI models for 30-minute and 2-hour intraday predictions", className="text-center text-muted mb-4")
+            html.P(
+                f"Using AI models for {RF_HORIZON_MINUTES}-minute and {LSTM_HORIZON_MINUTES}-minute intraday predictions",
+                className="text-center text-muted mb-4",
+            )
         ])
     ]),
     
@@ -554,11 +762,11 @@ app.layout = dbc.Container([
                 dbc.Row([
                     dbc.Col(dbc.Card([
                         html.Div(id="rf-status", className="text-center p-2", 
-                                children="AI 30-Min Model: Ready")
+                                children=f"{RF_MODEL_LABEL}: Ready")
                     ], color="light"), width=6),
                     dbc.Col(dbc.Card([
                         html.Div(id="lstm-status", className="text-center p-2", 
-                                children="AI 2-Hour Model: Ready")
+                                children=f"{LSTM_MODEL_LABEL}: Ready")
                     ], color="light"), width=6),
                 ])
             ], className="mb-4")
@@ -667,16 +875,17 @@ app.layout = dbc.Container([
                         dbc.Tab([
                             html.Div(id="rf-prediction-results"),
                             dcc.Graph(id="rf-prediction-chart")
-                        ], label="AI 30-Min Model"),
+                        ], label=RF_MODEL_LABEL),
                         dbc.Tab([
                             html.Div(id="lstm-prediction-results"),
                             dcc.Graph(id="lstm-prediction-chart")
-                        ], label="AI 2-Hour Model"),
+                        ], label=LSTM_MODEL_LABEL),
                         dbc.Tab([
                             html.Div(id="sentiment-summary-cards", className="mb-3"),
                             dcc.Graph(id="sentiment-history-chart")
                         ], label="Sentiment Analysis")
-                    ])
+                    ]),
+                    html.Div(id="trade-decision-panel", className="mt-3")
                 ])
             ])
         ])
@@ -874,7 +1083,7 @@ def update_price_chart(data):
     if data is None:
         return go.Figure().update_layout(title="No data available")
     
-    df = pd.read_json(data, orient='split')
+    df = _read_store_json(data)
     
     fig = go.Figure()
     
@@ -927,7 +1136,7 @@ def update_technical_charts(data):
         empty_fig = go.Figure().update_layout(title="No data available")
         return empty_fig, empty_fig, empty_fig, empty_fig
     
-    df = pd.read_json(data, orient='split')
+    df = _read_store_json(data)
     
     # Moving Averages Chart
     ma_fig = go.Figure()
@@ -980,18 +1189,10 @@ def update_technical_charts(data):
 )
 def train_models(n_clicks, data):
     if n_clicks is None or data is None:
-        return "AI 30-Min Model: Ready", "AI 2-Hour Model: Ready", None, None, False, "", False, "", "", ""
+        return f"{RF_MODEL_LABEL}: Ready", f"{LSTM_MODEL_LABEL}: Ready", None, None, False, "", False, "", "", ""
     
     try:
-        from io import StringIO
-        import json
-        
-        # Convert the data to a string if it's a dict
-        if isinstance(data, dict):
-            data = json.dumps(data)
-            
-        # Parse JSON string to DataFrame
-        df = pd.read_json(StringIO(data), orient='split')
+        df = _read_store_json(data)
         if df.empty:
             raise ValueError("No data available for training")
             
@@ -1005,8 +1206,8 @@ def train_models(n_clicks, data):
         error_msg = f"Error loading data: {str(e)}"
         print(error_msg)
         return (
-            "AI 30-Min Model: Error", 
-            "AI 2-Hour Model: Error", 
+            f"{RF_MODEL_LABEL}: Error", 
+            f"{LSTM_MODEL_LABEL}: Error", 
             None, 
             None, 
             True, 
@@ -1030,8 +1231,8 @@ def train_models(n_clicks, data):
     ])
     
     # Train RF model
-    rf_status = "AI 30-Min Model: Training..."
-    lstm_status = "AI 2-Hour Model: Waiting..."
+    rf_status = f"{RF_MODEL_LABEL}: Training..."
+    lstm_status = f"{LSTM_MODEL_LABEL}: Waiting..."
     
     # Spinner content - show during training
     rf_spinner_content = "Training RF"
@@ -1042,23 +1243,23 @@ def train_models(n_clicks, data):
     if rf_model is not None:
         rf_holdout = rf_metrics.get("holdout", {})
         rf_status = (
-            f"AI 30-Min Model: Trained (Test DA {rf_holdout.get('directional_accuracy', 0.0):.1f}% | "
-            f"R² {rf_holdout.get('r2', 0.0):.3f})"
+            f"{RF_MODEL_LABEL}: Trained (Test DA {rf_holdout.get('directional_accuracy', 0.0):.1f}% | "
+            f"R2 {rf_holdout.get('r2', 0.0):.3f})"
         )
         rf_model_info = {"model_path": "models/rf_model.joblib", "metrics": rf_metrics}
     else:
-        rf_status = f"AI 30-Min Model: Error - {rf_metrics.get('error', 'Unknown error')}"
+        rf_status = f"{RF_MODEL_LABEL}: Error - {rf_metrics.get('error', 'Unknown error')}"
         rf_model_info = None
     
     # Train LSTM model
-    lstm_status = "AI 2-Hour Model: Training..."
-    lstm_spinner_content = "Training AI 2-Hour Model"
+    lstm_status = f"{LSTM_MODEL_LABEL}: Training..."
+    lstm_spinner_content = f"Training {LSTM_MODEL_LABEL}"
     lstm_model, lstm_history = train_lstm_model(df, "lstm-status")
     if lstm_model is not None:
         lstm_holdout = lstm_history.get("holdout", {})
         lstm_status = (
-            f"AI 2-Hour Model: Trained (Test DA {lstm_holdout.get('directional_accuracy', 0.0):.1f}% | "
-            f"R² {lstm_holdout.get('r2', 0.0):.3f})"
+            f"{LSTM_MODEL_LABEL}: Trained (Test DA {lstm_holdout.get('directional_accuracy', 0.0):.1f}% | "
+            f"R2 {lstm_holdout.get('r2', 0.0):.3f})"
         )
         lstm_model_info = {
             "model_path": "models/lstm_model.h5",
@@ -1066,7 +1267,7 @@ def train_models(n_clicks, data):
             "metrics": lstm_history,
         }
     else:
-        lstm_status = f"AI 2-Hour Model: Error - {lstm_history.get('error', 'Unknown error')}"
+        lstm_status = f"{LSTM_MODEL_LABEL}: Error - {lstm_history.get('error', 'Unknown error')}"
         lstm_model_info = None
     
     # Show completion notification
@@ -1078,11 +1279,11 @@ def train_models(n_clicks, data):
         html.P("Both models have been trained and chronologically tested (20% holdout)."),
         html.P(
             f"RF Test: DA {rf_holdout.get('directional_accuracy', 0.0):.1f}% | "
-            f"R² {rf_holdout.get('r2', 0.0):.3f} | RMSE {rf_holdout.get('rmse', 0.0):.3f}"
+            f"R2 {rf_holdout.get('r2', 0.0):.3f} | RMSE {rf_holdout.get('rmse', 0.0):.3f}"
         ),
         html.P(
-            f"2-Hour Ensemble Test: DA {lstm_holdout.get('directional_accuracy', 0.0):.1f}% | "
-            f"R² {lstm_holdout.get('r2', 0.0):.3f} | RMSE {lstm_holdout.get('rmse', 0.0):.3f}"
+            f"{LSTM_HORIZON_MINUTES}-Min Ensemble Test: DA {lstm_holdout.get('directional_accuracy', 0.0):.1f}% | "
+            f"R2 {lstm_holdout.get('r2', 0.0):.3f} | RMSE {lstm_holdout.get('rmse', 0.0):.3f}"
         ),
         html.P("You can now make predictions using the 'Predict' button.", className="mb-0")
     ])
@@ -1113,6 +1314,7 @@ def train_models(n_clicks, data):
      Output("lstm-prediction-chart", "figure"),
      Output("rf-predictions-store", "data"),
      Output("lstm-predictions-store", "data"),
+     Output("trade-decision-panel", "children"),
      Output("training-notification", "is_open", allow_duplicate=True),
      Output("training-notification", "children", allow_duplicate=True),
      Output("completion-notification", "is_open", allow_duplicate=True),
@@ -1129,9 +1331,9 @@ def train_models(n_clicks, data):
 def make_predictions(n_clicks, data, rf_model_info, lstm_model_info, selected_symbol):
     if n_clicks is None or data is None:
         empty_fig = go.Figure().update_layout(title="No predictions available")
-        return html.Div(), html.Div(), empty_fig, empty_fig, None, None, False, "", False, "", "", ""
+        return html.Div(), html.Div(), empty_fig, empty_fig, None, None, html.Div(), False, "", False, "", "", ""
     
-    df = pd.read_json(data, orient='split')
+    df = _read_store_json(data)
     
     # Get sentiment features for the stock
     ticker = selected_symbol or (df.get('Ticker', ['GOOGL']).iloc[0] if 'Ticker' in df.columns else 'GOOGL')
@@ -1150,12 +1352,13 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info, selected_sy
         }
     
     # Initialize results
-    rf_results = html.Div("No AI 30-Min model trained.")
-    lstm_results = html.Div("No AI 2-Hour model trained.")
-    rf_fig = go.Figure().update_layout(title="No AI 30-Min predictions available")
-    lstm_fig = go.Figure().update_layout(title="No AI 2-Hour predictions available")
+    rf_results = html.Div(f"No {RF_MODEL_LABEL} trained.")
+    lstm_results = html.Div(f"No {LSTM_MODEL_LABEL} trained.")
+    rf_fig = go.Figure().update_layout(title=f"No {RF_MODEL_LABEL} predictions available")
+    lstm_fig = go.Figure().update_layout(title=f"No {LSTM_MODEL_LABEL} predictions available")
     rf_predictions = None
     lstm_predictions = None
+    trade_panel = dbc.Alert("No trade decision available. Train models and generate predictions first.", color="light")
     
     # RF Predictions
     if rf_model_info is not None:
@@ -1163,26 +1366,30 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info, selected_sy
             # Load RF model
             rf_model = EnhancedRandomForestModel.load_model(rf_model_info["model_path"])
 
-            # Ensure horizon is 30 minutes for intraday prediction
-            rf_model.horizon_steps = 30
+            loaded_rf_horizon = int(getattr(rf_model, "horizon_steps", RF_HORIZON_MINUTES))
+            if loaded_rf_horizon != RF_HORIZON_MINUTES:
+                raise ValueError(
+                    f"Loaded RF model horizon is {loaded_rf_horizon} minutes. "
+                    f"Retrain models for {RF_HORIZON_MINUTES}-minute RF setup."
+                )
             
-            # Make predictions with sentiment features (30 minutes ahead)
-            next_day_price = rf_model.predict_next_30min(df, sentiment_features=sentiment_features)
+            # Make horizon-aligned intraday prediction.
+            rf_pred_price = rf_model.predict_future(df, sentiment_features=sentiment_features)
             
             # Current price
             last_price = df['Close'].iloc[-1]
             last_date = df['Date'].iloc[-1]
             
             # Calculate change
-            change = next_day_price - last_price
+            change = rf_pred_price - last_price
             pct_change = (change / last_price) * 100
             rf_holdout = (rf_model_info.get("metrics", {}) or {}).get("holdout", {})
             
             # Create results display
             rf_results = html.Div([
-                html.H5("AI 30-Minute Prediction"),
+                html.H5(f"AI {RF_HORIZON_MINUTES}-Minute Prediction"),
                 html.P(f"Last Close: ${last_price:.2f}"),
-                html.P(f"Predicted Next 30 Minutes: ${next_day_price:.2f}"),
+                html.P(f"Predicted Next {RF_HORIZON_MINUTES} Minutes: ${rf_pred_price:.2f}"),
                 html.P([
                     f"Change: ${change:.2f} (",
                     html.Span(f"{pct_change:.2f}%", 
@@ -1192,7 +1399,7 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info, selected_sy
                 html.Hr(),
                 html.H6("Verified Test Metrics (20% Holdout)"),
                 html.P(f"Directional Accuracy: {rf_holdout.get('directional_accuracy', 0.0):.1f}%"),
-                html.P(f"R-squared (R²): {rf_holdout.get('r2', 0.0):.3f}"),
+                html.P(f"R-squared (R2): {rf_holdout.get('r2', 0.0):.3f}"),
                 html.P(f"RMSE: {rf_holdout.get('rmse', 0.0):.3f}"),
                 html.Hr(),
                 html.H6("Sentiment Analysis", className="mt-3"),
@@ -1218,19 +1425,19 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info, selected_sy
                 line=dict(color='blue')
             ))
             
-            # Add next day prediction point
-            next_day_date = last_date + timedelta(minutes=30)
+            # Add horizon prediction point.
+            rf_prediction_date = last_date + timedelta(minutes=RF_HORIZON_MINUTES)
             rf_fig.add_trace(go.Scatter(
-                x=[next_day_date],
-                y=[next_day_price],
-                name="+30 Min Prediction",
+                x=[rf_prediction_date],
+                y=[rf_pred_price],
+                name=f"+{RF_HORIZON_MINUTES} Min Prediction",
                 mode="markers",
                 marker=dict(size=12, color='red')
             ))
             
             # Update layout
             rf_fig.update_layout(
-                title="AI 30-Minute Prediction",
+                title=f"AI {RF_HORIZON_MINUTES}-Minute Prediction",
                 xaxis_title="Date",
                 yaxis_title="Price",
                 height=400,
@@ -1239,8 +1446,8 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info, selected_sy
             
             # Store predictions
             rf_predictions = pd.DataFrame({
-                'Date': [next_day_date],
-                'Predicted_Close': [next_day_price]
+                'Date': [rf_prediction_date],
+                'Predicted_Close': [rf_pred_price]
             }).to_json(date_format='iso', orient='split')
             
         except Exception as e:
@@ -1252,6 +1459,12 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info, selected_sy
             model_path = lstm_model_info.get("model_path", "models/lstm_model.h5")
             print(f"Loading LSTM model from {model_path}...")
             lstm_model = LSTMModel.load(model_path)
+            loaded_lstm_horizon = int(getattr(lstm_model, "horizon_steps", LSTM_HORIZON_MINUTES))
+            if loaded_lstm_horizon != LSTM_HORIZON_MINUTES:
+                raise ValueError(
+                    f"Loaded LSTM model horizon is {loaded_lstm_horizon} minutes. "
+                    f"Retrain models for {LSTM_HORIZON_MINUTES}-minute LSTM setup."
+                )
 
             # Require trained model artifacts only (no ad-hoc fallback/minimal predictions).
             if lstm_model.model is None and lstm_model.tabular_model is None:
@@ -1269,7 +1482,7 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info, selected_sy
                     f"Prediction blocked: method '{prediction_method}' is a fallback path, not the trained/evaluated model."
                 )
 
-            next_month_price = prediction_info['predicted_price']
+            lstm_pred_price = prediction_info['predicted_price']
             lower_bound, upper_bound = prediction_info['confidence_interval']
             uncertainty = prediction_info['uncertainty']
             print(f"Using prediction method: {prediction_method}")
@@ -1279,21 +1492,21 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info, selected_sy
             last_date = df['Date'].iloc[-1]
             
             # Calculate change
-            change = next_month_price - last_price
+            change = lstm_pred_price - last_price
             pct_change = (change / last_price) * 100
             
             # Format confidence interval
             confidence_range = f"${lower_bound:.2f} to ${upper_bound:.2f}"
-            confidence_pct = (upper_bound - lower_bound) / next_month_price * 100
+            confidence_pct = (upper_bound - lower_bound) / max(abs(lstm_pred_price), 1e-8) * 100
             lstm_holdout = (
                 (lstm_model_info.get("metrics", {}) or lstm_model_info.get("history", {}) or {}).get("holdout", {})
             )
             
             # Create results display with uncertainty information
             lstm_results = html.Div([
-                html.H5("AI 2-Hour Prediction"),
+                html.H5(f"AI {LSTM_HORIZON_MINUTES}-Minute Prediction"),
                 html.P(f"Last Close: ${last_price:.2f}"),
-                html.P(f"Predicted Next 2 Hours: ${next_month_price:.2f}"),
+                html.P(f"Predicted Next {LSTM_HORIZON_MINUTES} Minutes: ${lstm_pred_price:.2f}"),
                 html.P([
                     f"Change: ${change:.2f} (",
                     html.Span(f"{pct_change:.2f}%", 
@@ -1301,12 +1514,12 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info, selected_sy
                     ")"
                 ]),
                 html.P(f"95% Confidence Interval: {confidence_range}"),
-                html.P(f"Uncertainty: ±{uncertainty:.2f} (±{confidence_pct:.1f}%)"),
+                html.P(f"Uncertainty: +/-{uncertainty:.2f} (+/-{confidence_pct:.1f}%)"),
                 html.P(f"Prediction Method: {prediction_method}", className="text-muted small"),
                 html.Hr(),
                 html.H6("Verified Test Metrics (20% Holdout)"),
                 html.P(f"Directional Accuracy: {lstm_holdout.get('directional_accuracy', 0.0):.1f}%"),
-                html.P(f"R-squared (R²): {lstm_holdout.get('r2', 0.0):.3f}"),
+                html.P(f"R-squared (R2): {lstm_holdout.get('r2', 0.0):.3f}"),
                 html.P(f"RMSE: {lstm_holdout.get('rmse', 0.0):.3f}"),
                 html.Hr(),
                 html.H6("Sentiment Analysis", className="mt-3"),
@@ -1341,12 +1554,12 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info, selected_sy
                 marker=dict(size=10, color='blue')
             ))
 
-            # Add prediction point (+2 hours)
-            future_date = last_date + timedelta(hours=2)
+            # Add prediction point at configured LSTM horizon.
+            future_date = last_date + timedelta(minutes=LSTM_HORIZON_MINUTES)
             lstm_fig.add_trace(go.Scatter(
                 x=[future_date],
-                y=[next_month_price],
-                name="+2 Hr Prediction",
+                y=[lstm_pred_price],
+                name=f"+{LSTM_HORIZON_MINUTES} Min Prediction",
                 mode="markers",
                 marker=dict(size=12, color='red'),
                 error_y=dict(
@@ -1359,7 +1572,7 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info, selected_sy
             
             # Update layout
             lstm_fig.update_layout(
-                title="AI 2-Hour Prediction",
+                title=f"AI {LSTM_HORIZON_MINUTES}-Minute Prediction",
                 xaxis_title="Date",
                 yaxis_title="Price",
                 height=400,
@@ -1369,13 +1582,26 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info, selected_sy
             # Store predictions
             lstm_predictions = pd.DataFrame({
                 'Date': [future_date],
-                'Predicted_Close': [next_month_price],
+                'Predicted_Close': [lstm_pred_price],
                 'Lower_Bound': [lower_bound],
                 'Upper_Bound': [upper_bound]
             }).to_json(date_format='iso', orient='split')
             
         except Exception as e:
-            lstm_results = html.Div(f"Error making AI 2-Hour predictions: {str(e)}")
+            lstm_results = html.Div(f"Error making {LSTM_MODEL_LABEL} predictions: {str(e)}")
+
+    # Build rule-based trade decision only when both horizon predictions are available.
+    if rf_predictions is not None and lstm_predictions is not None:
+        try:
+            rf_df = _read_store_json(rf_predictions)
+            lstm_df = _read_store_json(lstm_predictions)
+            rf_price = float(rf_df['Predicted_Close'].iloc[-1])
+            lstm_price = float(lstm_df['Predicted_Close'].iloc[-1])
+            last_price = float(df['Close'].iloc[-1])
+            decision = build_trade_decision(rf_model_info, lstm_model_info, last_price, rf_price, lstm_price)
+            trade_panel = render_trade_decision_panel(decision)
+        except Exception as e:
+            trade_panel = dbc.Alert(f"Trade decision unavailable: {str(e)}", color="warning")
     
     # Show prediction notification
     training_notification = True
@@ -1397,7 +1623,21 @@ def make_predictions(n_clicks, data, rf_model_info, lstm_model_info, selected_sy
     rf_spinner_content = "Predicting"
     lstm_spinner_content = "Predicting"
     
-    return rf_results, lstm_results, rf_fig, lstm_fig, rf_predictions, lstm_predictions, training_notification, training_message, completion_notification, completion_message, rf_spinner_content, lstm_spinner_content
+    return (
+        rf_results,
+        lstm_results,
+        rf_fig,
+        lstm_fig,
+        rf_predictions,
+        lstm_predictions,
+        trade_panel,
+        training_notification,
+        training_message,
+        completion_notification,
+        completion_message,
+        rf_spinner_content,
+        lstm_spinner_content,
+    )
 
 # Callback for updating sentiment analysis
 @app.callback(
@@ -1413,7 +1653,7 @@ def update_sentiment_analysis(data, selected_stock):
         return empty_cards, empty_fig
     
     try:
-        _ = pd.read_json(data, orient='split')
+        _ = _read_store_json(data)
         ticker = selected_stock or 'GOOGL'
 
         sentiment_features = {
@@ -1447,3 +1687,4 @@ def update_sentiment_analysis(data, selected_stock):
 # Run the app
 if __name__ == '__main__':
     app.run(debug=True)
+
